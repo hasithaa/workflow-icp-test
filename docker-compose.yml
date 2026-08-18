@@ -1,0 +1,183 @@
+# Two networks, one bridge.
+#
+# `icp-net` holds the control plane and its database. `integration-net` holds the
+# integrations and their Temporal server. Only `edge` is attached to both, and it is a
+# plain TCP proxy — so an integration can reach the ICP, and the ICP has no route to any
+# integration. That is the property under test: workflow management has to work with
+# nothing listening on the integration side.
+#
+# Profiles:
+#   (default)   1 ICP node, 1 replica of each integration      — ~3.5 GB
+#   cluster     2 ICP nodes, 2 replicas of each integration    — ~6 GB, needs 8 GB for Docker
+
+name: workflow-icp-test
+
+networks:
+  icp-net:
+    name: wit-icp-net
+  integration-net:
+    name: wit-integration-net
+
+volumes:
+  postgres-data:
+  icp1-logs:
+  icp2-logs:
+
+services:
+  # ── Control plane side ──────────────────────────────────────────────────────
+  postgres:
+    image: postgres:16-alpine
+    networks: [icp-net]
+    environment:
+      POSTGRES_USER: ${POSTGRES_SUPERUSER:-postgres}
+      POSTGRES_PASSWORD: ${POSTGRES_SUPERPASSWORD:-postgres}
+      POSTGRES_DB: ${ICP_DB_NAME:-icp_db}
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+      # Ordered: the role first, then the ICP schema, then the grants. The ICP script is
+      # the real one from the server repo — staged by scripts/build-artifacts.sh — so a
+      # run of this environment is also a test of that script.
+      - ./db/initdb:/docker-entrypoint-initdb.d:ro
+      - ./artifacts/db:/opt/icp-db:ro
+    ports:
+      - "${POSTGRES_PORT:-55432}:5432"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_SUPERUSER:-postgres} -d ${ICP_DB_NAME:-icp_db}"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+
+  icp-1:
+    build:
+      context: ./icp
+      args:
+        ICP_DIST: ${ICP_DIST:-wso2-integration-control-plane-2.0.0-SNAPSHOT}
+    image: wit/icp:local
+    networks: [icp-net]
+    environment:
+      JAVA_TOOL_OPTIONS: -Xmx${ICP_HEAP:-512m}
+      ICP_NODE_ID: icp-1
+      ICP_DB_HOST: postgres
+      ICP_DB_NAME: ${ICP_DB_NAME:-icp_db}
+      ICP_DB_USER: ${ICP_DB_USER:-icp_user}
+      ICP_DB_PASSWORD: ${ICP_DB_PASSWORD:-icp_password}
+      ICP_PUBLIC_BASE_URL: ${ICP_PUBLIC_BASE_URL:-https://localhost:9446}
+    volumes:
+      - icp1-logs:/opt/icp/logs
+    depends_on:
+      postgres:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD-SHELL", "curl -sk https://localhost:9446/auth/capabilities >/dev/null || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 30
+      start_period: 60s
+
+  icp-2:
+    profiles: [cluster]
+    build:
+      context: ./icp
+      args:
+        ICP_DIST: ${ICP_DIST:-wso2-integration-control-plane-2.0.0-SNAPSHOT}
+    image: wit/icp:local
+    networks: [icp-net]
+    environment:
+      JAVA_TOOL_OPTIONS: -Xmx${ICP_HEAP:-512m}
+      ICP_NODE_ID: icp-2
+      ICP_DB_HOST: postgres
+      ICP_DB_NAME: ${ICP_DB_NAME:-icp_db}
+      ICP_DB_USER: ${ICP_DB_USER:-icp_user}
+      ICP_DB_PASSWORD: ${ICP_DB_PASSWORD:-icp_password}
+      ICP_PUBLIC_BASE_URL: ${ICP_PUBLIC_BASE_URL:-https://localhost:9446}
+    volumes:
+      - icp2-logs:/opt/icp/logs
+    depends_on:
+      postgres:
+        condition: service_healthy
+      icp-1:
+        # The schema is already there; this just avoids two nodes racing the first
+        # start-up bookkeeping against an empty database.
+        condition: service_healthy
+
+  # ── The only thing on both networks ─────────────────────────────────────────
+  edge:
+    image: nginx:1.27-alpine
+    networks: [icp-net, integration-net]
+    volumes:
+      - ./edge/${EDGE_CONF:-nginx.pinned.conf}:/etc/nginx/nginx.conf:ro
+    ports:
+      # The console, for a browser on the host.
+      - "${CONSOLE_PORT:-9446}:9446"
+      # The runtime listener, exposed only so you can curl it while debugging.
+      - "${RUNTIME_PORT:-9445}:9445"
+    depends_on:
+      icp-1:
+        condition: service_started
+
+  # ── Integration side ────────────────────────────────────────────────────────
+  temporal:
+    # The CLI image ships `server start-dev`: one container, SQLite-backed, and enough for
+    # several workers on one task queue. Pinned because dev-server flags do move.
+    image: temporalio/temporal:${TEMPORAL_TAG:-1.8.2}
+    networks: [integration-net]
+    # In-memory store, deliberately. A file-backed dev server needs a writable volume, and a
+    # named volume arrives root-owned while this image runs as uid 1000 — SQLite then fails
+    # with CANTOPEN, reported as "out of memory". Nothing here needs Temporal state to
+    # survive a restart: several workers still share one task queue, which is what the
+    # multi-node scenario is about. Restarting this service does drop in-flight workflow
+    # instances, so restart the integrations after it.
+    command: >
+      server start-dev --ip 0.0.0.0 --port 7233 --ui-port 8233 --log-level warn
+    ports:
+      - "${TEMPORAL_UI_PORT:-8233}:8233"
+    healthcheck:
+      test: ["CMD", "temporal", "operator", "cluster", "health", "--address", "127.0.0.1:7233"]
+      interval: 10s
+      timeout: 5s
+      retries: 20
+
+  expense:
+    build:
+      context: ./integrations/expense
+    image: wit/expense:local
+    networks: [integration-net]
+    deploy:
+      replicas: ${INTEGRATION_REPLICAS:-1}
+    environment:
+      JAVA_TOOL_OPTIONS: -Xmx${INTEGRATION_HEAP:-384m}
+      ICP_SERVER_URL: https://edge:9445
+      # One secret per integration: a secret binds to the first project/component that
+      # uses it, and a second integration presenting the same one is rejected with
+      # "Key ID ... is already bound to a different project/component".
+      ICP_ORG_SECRET: ${ICP_EXPENSE_SECRET:?run scripts/bootstrap.sh first - it mints the org secrets}
+      ICP_PROJECT: ${ICP_PROJECT:-workflow_icp_test}
+      ICP_ENVIRONMENT: ${ICP_ENVIRONMENT:-dev}
+      TEMPORAL_URL: temporal:7233
+      HEARTBEAT_INTERVAL: ${HEARTBEAT_INTERVAL:-10}
+    depends_on:
+      temporal:
+        condition: service_healthy
+      edge:
+        condition: service_started
+
+  orders:
+    build:
+      context: ./integrations/orders
+    image: wit/orders:local
+    networks: [integration-net]
+    deploy:
+      replicas: ${INTEGRATION_REPLICAS:-1}
+    environment:
+      JAVA_TOOL_OPTIONS: -Xmx${INTEGRATION_HEAP:-384m}
+      ICP_SERVER_URL: https://edge:9445
+      ICP_ORG_SECRET: ${ICP_ORDERS_SECRET:?run scripts/bootstrap.sh first - it mints the org secrets}
+      ICP_PROJECT: ${ICP_PROJECT:-workflow_icp_test}
+      ICP_ENVIRONMENT: ${ICP_ENVIRONMENT:-dev}
+      TEMPORAL_URL: temporal:7233
+      HEARTBEAT_INTERVAL: ${HEARTBEAT_INTERVAL:-10}
+    depends_on:
+      temporal:
+        condition: service_healthy
+      edge:
+        condition: service_started

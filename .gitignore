@@ -1,0 +1,15 @@
+# Builds of your branches, staged by scripts/build-artifacts.sh — not sources.
+artifacts/
+icp/artifacts/
+integrations/*/artifacts/
+
+# Ballerina build output from building the integrations on the host.
+integrations/*/target/
+integrations/*/Dependencies.toml
+
+# Local configuration, including the minted org secrets.
+.env
+.env.next
+
+# Editor noise
+.DS_Store

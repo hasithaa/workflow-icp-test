@@ -1,0 +1,27 @@
+# ── Workflow engine ───────────────────────────────────────────────────────────
+# A shared, self-hosted Temporal, not the embedded test server: replicas of this
+# integration have to be workers on the *same* task queue for multi-node to mean anything.
+[ballerina.workflow]
+mode = "SELF_HOSTED"
+url = "@TEMPORAL_URL@"
+namespace = "default"
+taskQueue = "ORDERS_TASK_QUEUE"
+
+# ── ICP runtime bridge ────────────────────────────────────────────────────────
+[wso2.icp.runtime.bridge]
+# The edge proxy's runtime listener (9445). The console (9446) would answer 405 on
+# /icp/heartbeat — different service, no such resource.
+serverUrl = "@ICP_SERVER_URL@"
+# The distribution serves a self-signed certificate; this skips verification.
+enableSSL = false
+heartbeatInterval = @HEARTBEAT_INTERVAL@
+
+secret = "@ICP_ORG_SECRET@"
+project = "@ICP_PROJECT@"
+integration = "orders_integration"
+environment = "@ICP_ENVIRONMENT@"
+
+# Without this the bridge still publishes workflow metadata but refuses tunneled
+# commands — and, since management is this integration's only entry point, the process
+# would also exit as soon as it finished registering.
+enableWorkflowManagement = true

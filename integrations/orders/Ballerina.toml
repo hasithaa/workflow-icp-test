@@ -1,0 +1,23 @@
+[package]
+org = "icptest"
+name = "orders_integration"
+version = "0.1.0"
+distribution = "2201.13.4"
+
+# Both resolve from the local repository. scripts/build-artifacts.sh publishes them:
+#   module-ballerina-workflow/ballerina : bal pack && bal push --repository=local
+#   icp-runtime-bridge                  : bal push --repository=local <built .bala>
+[[dependency]]
+org = "ballerina"
+name = "workflow"
+version = "0.9.0"
+repository = "local"
+
+[[dependency]]
+org = "wso2"
+name = "icp.runtime.bridge"
+version = "0.3.0-SNAPSHOT"
+repository = "local"
+
+[build-options]
+observabilityIncluded = false

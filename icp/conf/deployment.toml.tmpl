@@ -1,0 +1,43 @@
+# ICP node configuration for the Docker test environment.
+#
+# Postgres rather than the bundled H2, deliberately: this environment exists partly to
+# exercise the SQL scripts, and H2 would skip them entirely.
+
+serverHost = "0.0.0.0"
+serverPort = 9446
+runtimeListenerPort = 9445
+
+# What the browser uses to reach the console *through the edge proxy*. The console builds
+# its own links from this, so pointing it at the container name would break sign-in.
+publicBaseUrl = "@ICP_PUBLIC_BASE_URL@"
+
+logLevel = "INFO"
+enableAuditLogging = true
+enableMetrics = true
+
+schedulerIntervalSeconds = 60
+
+# The default auth backend's user store. A separate database, not a schema inside icp_db:
+# the credentials client sets no schema, so its tables must sit on the default search_path
+# of the database named here.
+credentialsDbType = "postgresql"
+credentialsDbHost = "@ICP_DB_HOST@"
+credentialsDbPort = 5432
+credentialsDbName = "credentials_db"
+credentialsDbUser = "@ICP_DB_USER@"
+credentialsDbPassword = "@ICP_DB_PASSWORD@"
+
+frontendJwtHMACSecret = "workflow-icp-test-secret-key-at-least-32-characters-long"
+
+[icp_server.storage]
+dbType = "postgresql"
+dbHost = "@ICP_DB_HOST@"
+dbPort = 5432
+dbName = "@ICP_DB_NAME@"
+dbUser = "@ICP_DB_USER@"
+dbPassword = "@ICP_DB_PASSWORD@"
+maxOpenConnections = 8
+minIdleConnections = 2
+# A runtime is declared offline this long after its last heartbeat. Kept close to the
+# integrations' heartbeat interval so a stopped replica shows up as offline quickly.
+heartbeatTimeoutSeconds = 30
