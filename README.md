@@ -11,13 +11,15 @@ It exists to test the three things the H2/single-process test setup could not:
 | **The SQL scripts** | Postgres, initialised from `postgresql_init.sql`, plus a fresh-vs-migrated comparison of `add_workflow_feature_postgresql.sql` |
 | **Cross-cluster operation** | The ICP has no network route to any integration. Everything works or nothing does |
 | **Multi-node** | Several workers per integration on one Temporal task queue, and optionally two ICP nodes |
+| **A real Temporal** | The open-source server on Postgres — SQL visibility, so the human-task views work; no dev-server caveats |
 
 ```
                 icp-net                    │  edge  │            integration-net
-  ┌──────────┐  ┌───────┐  ┌───────┐       │ (nginx │   ┌──────────┐  ┌──────────┐  ┌──────────┐
-  │ postgres │  │ icp-1 │  │ icp-2 │◄──────┤  L4    ├──►│ expense  │  │  orders  │  │ temporal │
-  └──────────┘  └───────┘  └───────┘       │ proxy) │   │  ×N      │  │   ×N     │  │ dev srv  │
-                                           └────────┘   └──────────┘  └──────────┘  └──────────┘
+  ┌──────────┐  ┌───────┐  ┌───────┐       │ (nginx │   ┌─────────┐ ┌────────┐ ┌──────────┐
+  │ postgres │  │ icp-1 │  │ icp-2 │◄──────┤  L4    ├──►│ expense │ │ orders │ │ temporal │
+  └──────────┘  └───────┘  └───────┘       │ proxy) │   │   ×N    │ │   ×N   │ │  + its   │
+                                           └────────┘   └─────────┘ └────────┘ │ postgres │
+                                                                               └──────────┘
                      ▲                                        │
                      └──── no route this way ─────────────────┘
 ```
@@ -29,7 +31,9 @@ reach the ICP; the ICP cannot reach an integration. That is the property under t
 
 ## Prerequisites
 
-- Docker with **8 GB** available for the cluster profile (~3.5 GB for the default one).
+- Docker with **8 GB** available for the cluster profile (~4 GB for the default one). Measured
+  idle on the default profile: ICP ~590 MB, each integration ~390 MB, Temporal ~90 MB, its
+  Postgres ~130 MB, the ICP's Postgres ~75 MB.
 - Local checkouts of the three repos, on the branches under test:
   `integration-control-plane`, `module-ballerina-workflow`, `icp-runtime-bridge`.
 - Ballerina **2201.13.4** on the host (integrations are built there, not in Docker — they need
@@ -46,15 +50,18 @@ SRC_ROOT=~/Source/workflow/ICP_REWAMP ./scripts/build-artifacts.sh
 # 2. Bring up the control plane, mint the org secrets, start the integrations.
 ./scripts/bootstrap.sh            # or: ./scripts/bootstrap.sh --cluster
 
-# 3. Drive the workflow features and assert the outcomes.
+# 3. Give the console user the roles the human tasks are addressed to (see Findings).
+./scripts/grant-task-roles.sh     # APPROVER, OPS
+
+# 4. Drive the workflow features and assert the outcomes.
 ./scripts/smoke.sh                # add --include-offline for the 503 check
 
-# 4. Test the SQL scripts (fresh install vs migrated, on the running Postgres).
+# 5. Test the SQL scripts (fresh install vs migrated, on the running Postgres).
 ./scripts/db-scripts-test.sh
 ```
 
 Console: <https://localhost:9446> (`admin` / `admin`, self-signed certificate).
-Temporal UI: <http://localhost:8233>. Postgres: `localhost:55432` (`postgres`/`postgres`).
+Temporal UI: `docker compose --profile ui up -d temporal-ui`, then <http://localhost:8233>. Postgres: `localhost:55432` (`postgres`/`postgres`).
 
 Tear down with `docker compose down -v` (the `-v` matters: the Postgres volume holds the
 initialised schema, so keeping it skips the init scripts next time).
@@ -80,7 +87,7 @@ because heartbeat processing runs that statement unconditionally. A missing tabl
 
 ### `scripts/smoke.sh` — the workflow features across the boundary
 
-19 assertions, all through the ICP's own HTTP API:
+22 assertions, all through the ICP's own HTTP API:
 
 - both integrations registered, each with the expected number of RUNNING runtimes;
 - both promoted to `ballerinaWorkflow` on their first full heartbeat (the auto-registration
@@ -88,8 +95,8 @@ because heartbeat processing runs that statement unconditionally. A missing tabl
   Workflows view);
 - every runtime published its descriptor and advertises `workflowCommands`;
 - definitions listed per integration, **from stored metadata** — no request into the runtime;
-- `expenseApproval` starts through the tunnel (HTTP 201), reaches RUNNING, and its human-task
-  child workflow exists in Temporal;
+- `expenseApproval` starts through the tunnel (HTTP 201), reaches RUNNING, its human task is
+  listed, is **completed through the tunnel**, and the workflow then reaches COMPLETED;
 - `orderFulfilment` starts and accepts suspend, resume and terminate while parked on an event;
 - with `--include-offline`: a stopped integration's instance views answer **503** while
   definitions still answer 200, because those come from the database.
@@ -153,15 +160,27 @@ Things the environment surfaced that are worth knowing before you use it:
   this environment gives them their own `credentials_db`. Note the shipped
   `deployment.toml` comment says credentials live "in a `credentials` schema within the same
   database", which does not match what the code does.
-- **Human-task listings need Temporal visibility the dev server does not serve.**
-  `humanTasks.list` and `humanTasks.pendingCount` round-trip correctly and answer an empty
-  page. The tunnel is not what is limited — the command reaches the integration and executes.
-  The smoke test therefore verifies the task in Temporal and reports the listing as a note.
-  Point the integrations at a full Temporal deployment if you need those views.
-- **Temporal here is in-memory.** A file-backed dev server needs a writable volume, and a named
-  volume arrives root-owned while the image runs as uid 1000 (SQLite then fails with CANTOPEN,
-  reported as "out of memory"). Restarting `temporal` drops in-flight instances — restart the
-  integrations after it.
+- **Empty human-task views are usually role gating, not a bug.** `awaitHumanTask(…, "APPROVER")`
+  is visible only to a caller holding APPROVER, and the ICP passes the *console user's* roles
+  into the tunnel. The seeded admin holds `Super Admin` and `Project Admin`, so the views are
+  correctly empty until the role exists and is granted — `scripts/grant-task-roles.sh` does
+  that (there is no GraphQL mutation for creating roles, so it seeds them). With APPROVER
+  granted, the listing returns the task with `canComplete: true` and completion drives the
+  workflow to COMPLETED. This was originally misdiagnosed here as a Temporal dev-server
+  limitation; it is not — the same emptiness occurs on the open-source server.
+- **Size the ICP connection pool above the concurrent heartbeat load.** With
+  `maxOpenConnections = 8`, two integrations plus the scheduler jobs were enough to leave a
+  heartbeat transaction `idle in transaction` while other heartbeats queued on its `runtimes`
+  row lock; the pool then timed out after 30s and the bridge reported
+  `Idle timeout triggered before initiating inbound response`. Nothing recovers on its own
+  until the ICP restarts. This environment uses 24, and it is worth knowing for real
+  deployments: the symptom looks like a network problem and is not one.
+- **auto-setup creates a database only when `DBNAME` differs from `POSTGRES_USER`.** Otherwise
+  it assumes the Postgres container made one named after the role — so `temporal-postgres` sets
+  `POSTGRES_DB` to the same value as its user, and `temporal_visibility` (which does differ) is
+  created by auto-setup.
+- **Temporal's frontend binds the container address, not loopback.** A healthcheck or CLI call
+  against `127.0.0.1:7233` inside the container is refused; use `$(hostname -i):7233`.
 
 ## API paths worth knowing
 
@@ -174,7 +193,8 @@ The console's workflow routes are not symmetric, which costs time when scripting
 | `GET  …/workflows/{id}` | one instance (queries the workflow directly — no visibility needed) |
 | `POST …/workflows` | **start** an instance |
 | `POST …/workflows/{id}/{suspend\|resume\|terminate\|cancel}` | lifecycle |
-| `GET  …/human-tasks`, `…/human-tasks/pending-count` | human-task views (see the visibility note) |
+| `GET  …/human-tasks`, `…/human-tasks/pending-count` | human-task views (role-gated — see Findings) |
+| `POST …/human-tasks/{taskId}/complete` | complete a task: `{"result": {…}}` |
 
 All of them are `…/icp/workflow/{componentId}/{environmentId}/…` and need a bearer token from
 `POST /auth/login`.
@@ -188,7 +208,7 @@ icp/                       image built from your assembled distribution + config
 integrations/expense|orders Ballerina sources, Config.toml template, image
 db/initdb/                 role, ICP schema (from the repo scripts), grants, credentials_db
 artifacts/db/              SQL staged from the ICP repo — do not edit here
-scripts/                   build-artifacts · bootstrap · smoke · db-scripts-test
+scripts/                   build-artifacts · bootstrap · grant-task-roles · smoke · db-scripts-test
 ```
 
 Artifacts (`icp/artifacts`, `integrations/*/artifacts`, `artifacts/db`) are staged by

@@ -8,7 +8,7 @@
 #   2. each was promoted to a workflow integration (display_type ballerinaWorkflow)
 #   3. definitions come from stored metadata, listed per integration
 #   4. a workflow starts through the tunnel and reaches RUNNING
-#   5. its human task child workflow exists (and what the ICP listing can show)
+#   5. its human task is listed, completed through the tunnel, and the workflow finishes
 #   6. lifecycle: an event-parked instance suspends, resumes and terminates
 #   7. an offline integration answers 503 rather than serving stale data (--include-offline)
 #
@@ -140,30 +140,60 @@ except Exception:
         && ok "the instance is RUNNING, parked on its human task" \
         || bad "the instance reported status='${status}' (expected RUNNING; GET returned $code)"
 
-    # The task itself is verified in Temporal, because the ICP's human-task *listing* needs
-    # Temporal visibility queries that the dev server does not serve — see the README. The
-    # tunnel is not what is limited here: the command reaches the integration and executes,
-    # and the answer is an empty page.
-    tasks=$(docker compose exec -T temporal temporal workflow list --address 127.0.0.1:7233 --limit 50 2>/dev/null \
-        | grep -c "humantask-expenseApproval.approveExpense" || true)
-    [ "${tasks:-0}" -ge 1 ] \
-        && ok "the human task child workflow exists in Temporal (${tasks} found)" \
-        || bad "no humantask child workflow was created"
-
-    code=$(wf GET "$EXPENSE_ID" "human-tasks?status=PENDING")
-    listed=$(python3 -c 'import json,sys
+    # The human task must be listed, and completing it must drive the workflow to COMPLETED.
+    # Listings are role-gated: the console user needs the role the task is addressed to
+    # (APPROVER here) or the page is correctly empty — scripts/grant-task-roles.sh.
+    taskId=""
+    for i in $(seq 1 10); do
+        code=$(wf GET "$EXPENSE_ID" "human-tasks?status=PENDING")
+        # This instance's task, not merely the first pending one: earlier runs leave their
+        # own tasks pending, and completing one of those proves nothing about this workflow.
+        taskId=$(python3 -c '
+import json, sys
+want = sys.argv[1]
 try:
-    print(len(json.load(open("/tmp/wf.out")).get("items",[])))
+    items = json.load(open("/tmp/wf.out")).get("items", [])
+except Exception:
+    items = []
+print(next((t["taskId"] for t in items if t.get("parentWorkflowId") == want), ""))
+' "$wfid")
+        [ -n "$taskId" ] && break
+        sleep 3
+    done
+    if [ -n "$taskId" ]; then
+        ok "the ICP lists the pending human task ($taskId)"
+
+        code=$(wf GET "$EXPENSE_ID" "human-tasks/pending-count")
+        count=$(python3 -c 'import json,sys
+try:
+    print(json.load(open("/tmp/wf.out")).get("count",0))
 except Exception:
     print(0)')
-    if [ "$code" = "200" ] && [ "${listed:-0}" -ge 1 ]; then
-        ok "the ICP lists ${listed} pending human task(s)"
-    elif [ "$code" = "200" ]; then
-        echo "  note  human-tasks listed 0 items (HTTP 200) - expected against the Temporal dev"
-        echo "        server, whose visibility queries cannot serve this listing. The command"
-        echo "        itself round-tripped, which is what the tunnel is responsible for."
+        [ "${count:-0}" -ge 1 ] && ok "pending-count reports ${count}" || bad "pending-count reported ${count}"
+
+        code=$(wf POST "$EXPENSE_ID" "human-tasks/${taskId}/complete" '{"result":{"approved":true,"comment":"smoke"}}')
+        [ "$code" = "200" ] && ok "the task was completed through the tunnel" \
+            || bad "complete returned $code: $(head -c 200 /tmp/wf.out)"
+
+        # The workflow resumes, runs its activity and finishes.
+        status=""
+        for i in $(seq 1 15); do
+            code=$(wf GET "$EXPENSE_ID" "workflows/${wfid}")
+            status=$(python3 -c 'import json,sys
+try:
+    print(json.load(open("/tmp/wf.out")).get("status",""))
+except Exception:
+    print("")')
+            [ "$status" = "COMPLETED" ] && break
+            sleep 3
+        done
+        [ "$status" = "COMPLETED" ] \
+            && ok "the workflow completed after the human decision" \
+            || bad "the workflow reported status='${status}' after completion (expected COMPLETED)"
     else
-        bad "human-tasks returned $code: $(head -c 200 /tmp/wf.out)"
+        bad "no pending human task was listed within ~30s. If the page is empty, check the"
+        echo "        console user's roles: human tasks are role-gated, and this one needs"
+        echo "        APPROVER — run scripts/grant-task-roles.sh, then sign in again."
     fi
 fi
 

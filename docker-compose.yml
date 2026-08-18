@@ -7,8 +7,9 @@
 # nothing listening on the integration side.
 #
 # Profiles:
-#   (default)   1 ICP node, 1 replica of each integration      — ~3.5 GB
-#   cluster     2 ICP nodes, 2 replicas of each integration    — ~6 GB, needs 8 GB for Docker
+#   (default)   1 ICP node, 1 replica of each integration      — ~4 GB
+#   cluster     2 ICP nodes, 2 replicas of each integration    — ~6.5 GB, needs 8 GB for Docker
+#   ui          adds the Temporal web UI on ${TEMPORAL_UI_PORT:-8233}
 
 name: workflow-icp-test
 
@@ -20,6 +21,7 @@ networks:
 
 volumes:
   postgres-data:
+  temporal-postgres-data:
   icp1-logs:
   icp2-logs:
 
@@ -116,26 +118,69 @@ services:
         condition: service_started
 
   # ── Integration side ────────────────────────────────────────────────────────
-  temporal:
-    # The CLI image ships `server start-dev`: one container, SQLite-backed, and enough for
-    # several workers on one task queue. Pinned because dev-server flags do move.
-    image: temporalio/temporal:${TEMPORAL_TAG:-1.8.2}
+  # The open-source server, not the dev server: SQL visibility on Postgres serves the list
+  # queries the human-task views need, which the dev server's store cannot. Its database lives
+  # on integration-net too, so the integration cluster stays self-contained — the ICP's
+  # Postgres is a separate container on the other network.
+  temporal-postgres:
+    image: postgres:16-alpine
     networks: [integration-net]
-    # In-memory store, deliberately. A file-backed dev server needs a writable volume, and a
-    # named volume arrives root-owned while this image runs as uid 1000 — SQLite then fails
-    # with CANTOPEN, reported as "out of memory". Nothing here needs Temporal state to
-    # survive a restart: several workers still share one task queue, which is what the
-    # multi-node scenario is about. Restarting this service does drop in-flight workflow
-    # instances, so restart the integrations after it.
-    command: >
-      server start-dev --ip 0.0.0.0 --port 7233 --ui-port 8233 --log-level warn
-    ports:
-      - "${TEMPORAL_UI_PORT:-8233}:8233"
+    environment:
+      POSTGRES_USER: ${TEMPORAL_DB_USER:-temporal}
+      POSTGRES_PASSWORD: ${TEMPORAL_DB_PASSWORD:-temporal}
+      # Named after the role deliberately: auto-setup creates a database only when its name
+      # differs from POSTGRES_USER, otherwise it assumes the Postgres container made one (which
+      # is exactly what happens here). `temporal_visibility` differs, so auto-setup creates it.
+      POSTGRES_DB: ${TEMPORAL_DB_USER:-temporal}
+    volumes:
+      - temporal-postgres-data:/var/lib/postgresql/data
     healthcheck:
-      test: ["CMD", "temporal", "operator", "cluster", "health", "--address", "127.0.0.1:7233"]
-      interval: 10s
+      test: ["CMD-SHELL", "pg_isready -U ${TEMPORAL_DB_USER:-temporal} -d ${TEMPORAL_DB_USER:-temporal}"]
+      interval: 5s
       timeout: 5s
       retries: 20
+
+  temporal:
+    image: temporalio/auto-setup:${TEMPORAL_TAG:-1.29.7}
+    networks: [integration-net]
+    environment:
+      DB: postgres12
+      DB_PORT: 5432
+      POSTGRES_SEEDS: temporal-postgres
+      POSTGRES_USER: ${TEMPORAL_DB_USER:-temporal}
+      POSTGRES_PWD: ${TEMPORAL_DB_PASSWORD:-temporal}
+      DBNAME: temporal
+      VISIBILITY_DBNAME: temporal_visibility
+      # Elasticsearch would be the other way to get advanced visibility; SQL visibility on
+      # Postgres is enough here and costs one container instead of two.
+      ENABLE_ES: "false"
+      SKIP_DEFAULT_NAMESPACE_CREATION: "false"
+      DEFAULT_NAMESPACE: default
+      DEFAULT_NAMESPACE_RETENTION: 24h
+    depends_on:
+      temporal-postgres:
+        condition: service_healthy
+    healthcheck:
+      # Not 127.0.0.1: the frontend binds the container's own address, so loopback is refused.
+      test: ["CMD-SHELL", "temporal operator cluster health --address $$(hostname -i):7233 | grep -q SERVING"]
+      interval: 10s
+      timeout: 10s
+      retries: 30
+      start_period: 60s
+
+  # Optional: `docker compose --profile ui up -d temporal-ui`
+  temporal-ui:
+    profiles: [ui]
+    image: temporalio/ui:${TEMPORAL_UI_TAG:-2.53.3}
+    networks: [integration-net]
+    environment:
+      TEMPORAL_ADDRESS: temporal:7233
+      TEMPORAL_CORS_ORIGINS: http://localhost:${TEMPORAL_UI_PORT:-8233}
+    ports:
+      - "${TEMPORAL_UI_PORT:-8233}:8080"
+    depends_on:
+      temporal:
+        condition: service_healthy
 
   expense:
     build:

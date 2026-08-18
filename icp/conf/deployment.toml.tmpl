@@ -36,8 +36,8 @@ dbPort = 5432
 dbName = "@ICP_DB_NAME@"
 dbUser = "@ICP_DB_USER@"
 dbPassword = "@ICP_DB_PASSWORD@"
-maxOpenConnections = 8
-minIdleConnections = 2
+maxOpenConnections = 24
+minIdleConnections = 4
 # A runtime is declared offline this long after its last heartbeat. Kept close to the
 # integrations' heartbeat interval so a stopped replica shows up as offline quickly.
 heartbeatTimeoutSeconds = 30
