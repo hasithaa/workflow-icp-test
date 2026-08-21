@@ -49,59 +49,8 @@ token=$(curl -sk -X POST "${CONSOLE}/auth/login" -H 'Content-Type: application/j
     | jqp 'd.get("token","")')
 [ -n "$token" ] || { echo "login failed" >&2; exit 1; }
 
-wf() {  # wf <METHOD> <component> <path> [body]
-    local method="$1" component="$2" path="$3" body="${4:-}"
-    if [ -n "$body" ]; then
-        curl -sk -o /tmp/wf.out -w '%{http_code}' -X "$method" \
-            "${CONSOLE}/icp/workflow/${component}/${ICP_ENVIRONMENT_ID}/${path}" \
-            -H 'Content-Type: application/json' -H "Authorization: Bearer ${token}" -d "$body"
-    else
-        curl -sk -o /tmp/wf.out -w '%{http_code}' -X "$method" \
-            "${CONSOLE}/icp/workflow/${component}/${ICP_ENVIRONMENT_ID}/${path}" \
-            -H "Authorization: Bearer ${token}"
-    fi
-}
-
-# The tunnel is asynchronous, and these two helpers are what that means for a caller.
-#
-# No request waits on a runtime. A read is accepted with 202 {"status":"FETCHING"} and
-# answered once some node's next heartbeat claims the fetch and posts the result; a mutation
-# is accepted with 202 {"operationId"} and its outcome is collected from operations/<id>.
-# Polling is therefore the contract, not a workaround for slowness -- asserting on the first
-# response tests the 202 and nothing else. Both helpers keep `wf`'s interface: the body lands
-# in /tmp/wf.out and the final HTTP code is printed, so assertions stay as they were.
-
-wf_read() {  # wf_read <component> <path> [budget_seconds]
-    local component="$1" path="$2" budget="${3:-60}" code waited=0
-    while :; do
-        code=$(wf GET "$component" "$path")
-        [ "$code" = "202" ] || { printf '%s' "$code"; return 0; }
-        [ "$waited" -ge "$budget" ] && { printf '%s' "$code"; return 0; }
-        sleep 2
-        waited=$((waited + 2))
-    done
-}
-
-wf_mutate() {  # wf_mutate <component> <path> <body> [budget_seconds]
-    local component="$1" path="$2" body="$3" budget="${4:-60}" code opid waited=0
-    code=$(wf POST "$component" "$path" "$body")
-    [ "$code" = "202" ] || { printf '%s' "$code"; return 0; }
-    opid=$(python3 -c 'import json
-try:
-    print(json.load(open("/tmp/wf.out")).get("operationId") or "")
-except Exception:
-    print("")')
-    [ -n "$opid" ] || { printf '%s' "$code"; return 0; }
-    while :; do
-        # 202 while PENDING or DELIVERED; then the operation's own status and body, or 504
-        # if no integration ever confirmed it.
-        code=$(wf GET "$component" "operations/${opid}")
-        [ "$code" = "202" ] || { printf '%s' "$code"; return 0; }
-        [ "$waited" -ge "$budget" ] && { printf '%s' "$code"; return 0; }
-        sleep 2
-        waited=$((waited + 2))
-    done
-}
+# shellcheck source=scripts/lib-wf.sh
+. "${HERE}/scripts/lib-wf.sh"
 
 # ── 1 & 2. registration and promotion ────────────────────────────────────────
 # Read from Postgres: the GraphQL schema has no query that enumerates components, and the
