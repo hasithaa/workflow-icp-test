@@ -36,10 +36,19 @@ if [ ! -f edge/certs/edge.crt ]; then
     echo "generated edge/certs/edge.crt"
 fi
 
-if [ "$CLUSTER" -eq 1 ] && [ -z "${EDGE_CONF:-}" ]; then
-    EDGE_CONF=nginx.roundrobin.conf
-    export EDGE_CONF
+if [ -z "${EDGE_CONF:-}" ]; then
+    [ "$CLUSTER" -eq 1 ] && EDGE_CONF=nginx.roundrobin.conf || EDGE_CONF=nginx.pinned.conf
 fi
+export EDGE_CONF
+# Persisted, not just exported. Any later `docker compose` command re-resolves this mount from
+# whatever its own shell happens to hold, and dependencies get recreated more often than you
+# would expect: `up -d --force-recreate expense orders` also recreates the edge, because both
+# integrations depend on it. Without a value in .env that silently remounts the pinned config
+# and the cluster keeps running -- pinned -- with nothing in any log to say so.
+touch .env
+grep -vE '^EDGE_CONF=' .env > .env.edge && printf 'EDGE_CONF=%s\n' "$EDGE_CONF" >> .env.edge
+mv .env.edge .env
+echo "edge config: ${EDGE_CONF} (written to .env)"
 
 : "${CONSOLE_PORT:=9446}"
 : "${ICP_ADMIN_USER:=admin}"
@@ -117,6 +126,12 @@ grep -vE '^ICP_(EXPENSE|ORDERS)_SECRET=' .env > .env.next 2>/dev/null || : > .en
 printf 'ICP_EXPENSE_SECRET=%s\n' "$expense_secret" >> .env.next
 printf 'ICP_ORDERS_SECRET=%s\n' "$orders_secret" >> .env.next
 mv .env.next .env
+# Exported as well as written, because compose reads the process environment BEFORE .env.
+# This script sources .env at startup, so without these two lines a re-bootstrap starts the
+# integrations on the secrets of the database that was just destroyed, and every heartbeat
+# answers "Unknown key ID" while .env on disk looks correct.
+export ICP_EXPENSE_SECRET="$expense_secret"
+export ICP_ORDERS_SECRET="$orders_secret"
 echo "ICP_EXPENSE_SECRET=${expense_secret:0:12}… ICP_ORDERS_SECRET=${orders_secret:0:12}… (written to .env)"
 
 log "Starting Temporal and the integrations"
