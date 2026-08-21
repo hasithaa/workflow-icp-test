@@ -43,8 +43,16 @@ reach the ICP; the ICP cannot reach an integration. That is the property under t
 ## Run it
 
 ```bash
-# 1. Build everything from your branches and stage it into the build contexts.
-#    Override SRC_ROOT if your checkouts are not in ~/Source/workflow/ICP_REWAMP.
+# 1. Build everything and stage it into the build contexts.
+#    With no local checkouts this CLONES each repository at a pinned ref, so all you need
+#    is Docker, Ballerina and this repository. With checkouts present it builds those
+#    instead — override SRC_ROOT if they are not in ~/Source/workflow/ICP_REWAMP, or set
+#    CLONE=1 to ignore them and build clean.
+#
+#    The refs it clones (override any of them):
+#      WORKFLOW_REF=main              ballerina-platform/module-ballerina-workflow, 0.9.0
+#      ICP_REF=workflow-tunnel        ICP PR #834 — the cache-table command tunnel
+#      BRIDGE_REF=workflow-metadata   bridge PR #44 — metadata + tunneled execution
 SRC_ROOT=~/Source/workflow/ICP_REWAMP ./scripts/build-artifacts.sh
 
 # 2. Bring up the control plane, mint the org secrets, start the integrations.
@@ -120,27 +128,50 @@ observable.
 
 ---
 
-## Clustering the ICP, and the limitation it exposes
+## Clustering the ICP
 
 `./scripts/bootstrap.sh --cluster` runs two ICP nodes against one Postgres, with two replicas
-of each integration.
+of each integration, and the edge round-robins both the console and the runtime port across
+them. **Round-robin is the default**, because it is the case the tunnel is now built for.
 
-**The command tunnel is single-instance today.** Its queue, waiters and results live in memory
-on the node that accepted the console request, so a result posted to a *different* node has
-nobody waiting for it and the caller times out with 504 after 25s. `edge/nginx.pinned.conf`
-(the default) therefore sends all workflow traffic to `icp-1`.
+It did not used to be. The tunnel's queue, waiters and results lived in memory on the node
+that accepted the console request, so a result posted to a *different* node had nobody
+waiting for it and the caller timed out with 504 — which is why `nginx.pinned.conf` existed
+and was the default. The queue is now two shared tables (`wf_read_cache`,
+`wf_operation_outbox`), so:
 
-To observe the limitation rather than work around it:
+- the node that accepts a request is usually **not** the node that delivers it, and that is
+  fine: the row is the queue, and whichever node answers the runtime's next heartbeat hands
+  the work over;
+- a result posted to either node lands on the row the browser is polling;
+- nothing is held open. A read answers `202 {status: "FETCHING"}` and the console polls; a
+  mutation answers `202 {operationId}` and the console polls that.
+
+`nginx.pinned.conf` is kept for contrast — running with it should now make no observable
+difference, and if it ever does, that is a bug worth reporting:
 
 ```bash
-EDGE_CONF=nginx.roundrobin.conf docker compose --profile cluster up -d edge
-./scripts/smoke.sh     # expect intermittent 504s on the tunnel calls
+EDGE_CONF=nginx.pinned.conf docker compose --profile cluster up -d edge
+./scripts/smoke.sh     # same results as round-robin
 ```
 
-Definitions keep working throughout, because they are served from the database. That contrast
-is the useful part: it shows exactly where the boundary between "clustered" and "not yet" sits,
-and it is the evidence for whichever fix is chosen — shared state for the queue, or routing
-workflow traffic by runtime.
+The properties worth checking by hand, since they are the ones a single node cannot show:
+
+| Check | How | Expected |
+|---|---|---|
+| Enqueue node ≠ delivering node | `docker compose logs icp-1 icp-2 \| grep -i workflow` | the node logging the request is routinely not the one delivering it |
+| Result to the other node | watch the edge log for `commandResult` | results land on both nodes; the console never notices |
+| Duplicate mutation | complete a human task with both integration replicas up | exactly one completion; the loser gets a conflict |
+| Unconfirmed mutation | kill a replica right after submitting one | the operation ends `EXPIRED` and an unresolved row appears in `system_events` |
+| Stale-while-refresh | complete a task, reload the list | the list still renders, with an age, and stops showing the task |
+| Node loss mid-flight | `docker compose stop icp-1` while polling | the browser carries on against `icp-2` |
+
+```sql
+-- the tunnel's own state, if you want to watch it work
+SELECT status, count(*) FROM wf_read_cache GROUP BY status;
+SELECT operation_id, status, runtime_id FROM wf_operation_outbox ORDER BY issued_at DESC LIMIT 10;
+SELECT event_type, severity, resolved, message FROM system_events ORDER BY created_at DESC LIMIT 5;
+```
 
 ---
 
