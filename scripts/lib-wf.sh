@@ -1,17 +1,24 @@
 # Shared helpers for driving workflow management through the ICP tunnel.
 #
-# Sourced by smoke.sh and populate.sh. Expects CONSOLE, ICP_ENVIRONMENT_ID and a $token
-# already in scope, and leaves each response body in /tmp/wf.out while printing the HTTP code
-# — so a caller reads like a plain curl even though every call may have been asynchronous.
+# Sourced by smoke.sh, populate.sh and edge-cases.sh. Expects CONSOLE, ICP_ENVIRONMENT_ID and
+# a $token already in scope, and leaves each response body in $WF_OUT (default /tmp/wf.out)
+# while printing the HTTP code — so a caller reads like a plain curl even though every call
+# may have been asynchronous.
+#
+# Set WF_OUT before calling these CONCURRENTLY. One fixed path is fine for sequential use and
+# silently wrong for parallel use: two callers overwrite each other's body, so one of them
+# parses the other's answer. That cost a race test which reported a pass while actually
+# reading the wrong file.
+: "${WF_OUT:=/tmp/wf.out}"
 
 wf() {  # wf <METHOD> <component> <path> [body]
     local method="$1" component="$2" path="$3" body="${4:-}"
     if [ -n "$body" ]; then
-        curl -sk -o /tmp/wf.out -w '%{http_code}' -X "$method" \
+        curl -sk -o "$WF_OUT" -w '%{http_code}' -X "$method" \
             "${CONSOLE}/icp/workflow/${component}/${ICP_ENVIRONMENT_ID}/${path}" \
             -H 'Content-Type: application/json' -H "Authorization: Bearer ${token}" -d "$body"
     else
-        curl -sk -o /tmp/wf.out -w '%{http_code}' -X "$method" \
+        curl -sk -o "$WF_OUT" -w '%{http_code}' -X "$method" \
             "${CONSOLE}/icp/workflow/${component}/${ICP_ENVIRONMENT_ID}/${path}" \
             -H "Authorization: Bearer ${token}"
     fi
@@ -40,9 +47,9 @@ wf_mutate() {  # wf_mutate <component> <path> <body> [budget_seconds]
     local component="$1" path="$2" body="$3" budget="${4:-60}" code opid waited=0
     code=$(wf POST "$component" "$path" "$body")
     [ "$code" = "202" ] || { printf '%s' "$code"; return 0; }
-    opid=$(python3 -c 'import json
+    opid=$(WF_OUT="$WF_OUT" python3 -c 'import json, os
 try:
-    print(json.load(open("/tmp/wf.out")).get("operationId") or "")
+    print(json.load(open(os.environ["WF_OUT"])).get("operationId") or "")
 except Exception:
     print("")')
     [ -n "$opid" ] || { printf '%s' "$code"; return 0; }
