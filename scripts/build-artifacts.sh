@@ -80,15 +80,29 @@ resolve_repo() {
     mkdir -p "$CLONE_DIR"
     if [ -d "$dest/.git" ]; then
         echo "updating clone: $dest ($ref)" >&2
-        git -C "$dest" fetch --quiet origin "$ref"
+        # The URL may have changed since this clone was made — a different fork, or a ref
+        # that only exists on one of them. Re-point it rather than fetching from whatever
+        # origin happened to be first.
+        git -C "$dest" remote set-url origin "$url"
     else
         echo "cloning $url ($ref) -> $dest" >&2
         git clone --quiet "$url" "$dest"
-        git -C "$dest" fetch --quiet origin "$ref"
+    fi
+
+    # Checked explicitly, because a failure here is the one that must not be survivable: a
+    # missing ref used to leave the previous checkout in place while the log still announced
+    # the ref that was asked for, so the build produced the wrong artifacts and said nothing.
+    if ! git -C "$dest" fetch --quiet origin "$ref"; then
+        echo "cannot fetch ref '$ref' from $url" >&2
+        echo "  (a branch on a fork? set the matching *_GIT variable as well as *_REF)" >&2
+        exit 1
     fi
     # Detached on purpose: this is a build input, not a branch anyone works on here.
-    git -C "$dest" -c advice.detachedHead=false checkout --quiet FETCH_HEAD
-    echo "$name at $(git -C "$dest" rev-parse --short HEAD) ($ref)" >&2
+    if ! git -C "$dest" -c advice.detachedHead=false checkout --quiet FETCH_HEAD; then
+        echo "cannot check out '$ref' in $dest" >&2
+        exit 1
+    fi
+    echo "$name at $(git -C "$dest" rev-parse --short HEAD) ($ref from $url)" >&2
     printf '%s' "$dest"
 }
 
