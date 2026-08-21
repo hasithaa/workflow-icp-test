@@ -15,11 +15,36 @@ set -euo pipefail
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$HERE"
 
-# Where your checkouts are. Override if your layout differs.
+# Where the sources come from.
+#
+# Two modes, and the default suits whoever is running this. With no checkouts present the
+# script CLONES each repository at a pinned ref, so someone reviewing the PRs needs nothing
+# but Docker, Ballerina and this repository. With checkouts present it builds those instead,
+# because when you are iterating on a branch you want what is on disk, not what is pushed.
+#
+# Set CLONE=1 to clone even when checkouts exist (a clean-room build), or CLONE=0 to insist
+# on local ones.
 : "${SRC_ROOT:=$HOME/Source/workflow/ICP_REWAMP}"
 : "${ICP_REPO:=$SRC_ROOT/integration-control-plane}"
 : "${WORKFLOW_REPO:=$SRC_ROOT/module-ballerina-workflow}"
 : "${BRIDGE_REPO:=$SRC_ROOT/icp-runtime-bridge}"
+
+# What to clone, when cloning. The refs are the point of this environment: it tests the
+# branches under review, against a workflow module release that already carries what they
+# need.
+#
+# The module is taken from main: the management command API and the protocol-independent
+# error code (module PRs #94 and #95) are merged there and it is already 0.9.0, which is the
+# version the bridge's generated glue compiles against.
+: "${WORKFLOW_GIT:=https://github.com/ballerina-platform/module-ballerina-workflow.git}"
+: "${WORKFLOW_REF:=main}"
+# ICP PR #834 — the workflow command tunnel, now cache-table backed.
+: "${ICP_GIT:=https://github.com/hasithaa/integration-control-plane.git}"
+: "${ICP_REF:=workflow-tunnel}"
+# Bridge PR #44 — metadata publishing and tunneled command execution.
+: "${BRIDGE_GIT:=https://github.com/hasithaa/icp-runtime-bridge.git}"
+: "${BRIDGE_REF:=workflow-metadata}"
+: "${CLONE_DIR:=$HERE/.sources}"
 : "${ICP_DIST:=wso2-integration-control-plane-2.0.0-SNAPSHOT}"
 : "${BAL_DIST_VERSION:=2201.13.4}"
 
@@ -34,13 +59,50 @@ for arg in "$@"; do
 done
 
 log() { printf '\n=== %s\n' "$*"; }
+
+# Resolves one repository to a directory to build from: a local checkout when there is one
+# (and cloning was not demanded), otherwise a clone pinned to its ref. Re-runs fetch rather
+# than re-clone, so this is cheap to repeat.
+#
+# Prints the path on stdout; everything else goes to stderr so the caller can capture it.
+resolve_repo() {
+    local name="$1" local_dir="$2" url="$3" ref="$4"
+    if [ "${CLONE:-auto}" != "1" ] && [ -d "$local_dir/.git" ]; then
+        echo "using local checkout: $local_dir" >&2
+        printf '%s' "$local_dir"
+        return
+    fi
+    if [ "${CLONE:-auto}" = "0" ]; then
+        echo "missing: $local_dir (CLONE=0 forbids cloning; set SRC_ROOT or the *_REPO vars)" >&2
+        exit 1
+    fi
+    local dest="$CLONE_DIR/$name"
+    mkdir -p "$CLONE_DIR"
+    if [ -d "$dest/.git" ]; then
+        echo "updating clone: $dest ($ref)" >&2
+        git -C "$dest" fetch --quiet origin "$ref"
+    else
+        echo "cloning $url ($ref) -> $dest" >&2
+        git clone --quiet "$url" "$dest"
+        git -C "$dest" fetch --quiet origin "$ref"
+    fi
+    # Detached on purpose: this is a build input, not a branch anyone works on here.
+    git -C "$dest" -c advice.detachedHead=false checkout --quiet FETCH_HEAD
+    echo "$name at $(git -C "$dest" rev-parse --short HEAD) ($ref)" >&2
+    printf '%s' "$dest"
+}
+
 require_dir() { [ -d "$1" ] || { echo "missing: $1 (set SRC_ROOT or the individual *_REPO vars)" >&2; exit 1; }; }
 
 mkdir -p icp/artifacts artifacts/db integrations/expense/artifacts integrations/orders/artifacts
 
+log "Resolving sources"
+ICP_REPO="$(resolve_repo integration-control-plane "$ICP_REPO" "$ICP_GIT" "$ICP_REF")"
+WORKFLOW_REPO="$(resolve_repo module-ballerina-workflow "$WORKFLOW_REPO" "$WORKFLOW_GIT" "$WORKFLOW_REF")"
+BRIDGE_REPO="$(resolve_repo icp-runtime-bridge "$BRIDGE_REPO" "$BRIDGE_GIT" "$BRIDGE_REF")"
+
 # ── 1. ICP distribution ──────────────────────────────────────────────────────
 if [ "$SKIP_ICP" -eq 0 ]; then
-    require_dir "$ICP_REPO"
     log "Assembling the ICP distribution"
     (cd "$ICP_REPO" && ./gradlew assembleICP)
     cp "$ICP_REPO/build/distribution/${ICP_DIST}.zip" "icp/artifacts/${ICP_DIST}.zip"
@@ -48,18 +110,18 @@ if [ "$SKIP_ICP" -eq 0 ]; then
 fi
 
 # ── 2. SQL scripts, staged so Postgres initialises from the real ones ────────
-require_dir "$ICP_REPO"
 log "Staging the ICP SQL scripts"
 cp "$ICP_REPO/icp_server/resources/db/init-scripts/postgresql_init.sql" artifacts/db/
 cp "$ICP_REPO/icp_server/resources/db/init-scripts/credentials_postgresql_init.sql" artifacts/db/
 cp "$ICP_REPO/icp_server/resources/db/migration-scripts/add_workflow_feature_postgresql.sql" artifacts/db/
+# The tunnel's tables. A fresh database gets them from postgresql_init.sql; this is the
+# script an existing deployment runs, staged so that path can be exercised here too.
+cp "$ICP_REPO/icp_server/resources/db/migration-scripts/add_workflow_tunnel_postgresql.sql" artifacts/db/ 2>/dev/null \
+    || echo "note: no add_workflow_tunnel_postgresql.sql in this ICP ref (pre-cache-table branch)"
 echo "staged artifacts/db: $(ls artifacts/db | tr '\n' ' ')"
 
 # ── 3. Dependencies into the local bala repository ────────────────────────────
 if [ "$SKIP_DEPS" -eq 0 ]; then
-    require_dir "$WORKFLOW_REPO"
-    require_dir "$BRIDGE_REPO"
-
     log "Publishing the workflow module to the local repository"
     (cd "$WORKFLOW_REPO" && ./gradlew :workflow-ballerina:build -x test)
     (cd "$WORKFLOW_REPO/ballerina" && bal pack)

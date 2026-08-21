@@ -13,3 +13,5 @@ integrations/*/Dependencies.toml
 
 # Editor noise
 .DS_Store
+# Clones made by scripts/build-artifacts.sh when no local checkout is present.
+.sources/

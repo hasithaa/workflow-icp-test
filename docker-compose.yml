@@ -63,7 +63,7 @@ services:
       ICP_DB_NAME: ${ICP_DB_NAME:-icp_db}
       ICP_DB_USER: ${ICP_DB_USER:-icp_user}
       ICP_DB_PASSWORD: ${ICP_DB_PASSWORD:-icp_password}
-      ICP_PUBLIC_BASE_URL: ${ICP_PUBLIC_BASE_URL:-https://localhost:9446}
+      ICP_PUBLIC_BASE_URL: ${ICP_PUBLIC_BASE_URL:-https://localhost:9664}
     volumes:
       - icp1-logs:/opt/icp/logs
     depends_on:
@@ -91,7 +91,7 @@ services:
       ICP_DB_NAME: ${ICP_DB_NAME:-icp_db}
       ICP_DB_USER: ${ICP_DB_USER:-icp_user}
       ICP_DB_PASSWORD: ${ICP_DB_PASSWORD:-icp_password}
-      ICP_PUBLIC_BASE_URL: ${ICP_PUBLIC_BASE_URL:-https://localhost:9446}
+      ICP_PUBLIC_BASE_URL: ${ICP_PUBLIC_BASE_URL:-https://localhost:9664}
     volumes:
       - icp2-logs:/opt/icp/logs
     depends_on:
@@ -107,10 +107,10 @@ services:
     image: nginx:1.27-alpine
     networks: [icp-net, integration-net]
     volumes:
-      - ./edge/${EDGE_CONF:-nginx.pinned.conf}:/etc/nginx/nginx.conf:ro
+      - ./edge/${EDGE_CONF:-nginx.roundrobin.conf}:/etc/nginx/nginx.conf:ro
     ports:
       # The console, for a browser on the host.
-      - "${CONSOLE_PORT:-9446}:9446"
+      - "${CONSOLE_PORT:-9664}:9446"
       # The runtime listener, exposed only so you can curl it while debugging.
       - "${RUNTIME_PORT:-9445}:9445"
     depends_on:
