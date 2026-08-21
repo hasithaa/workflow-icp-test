@@ -62,6 +62,47 @@ wf() {  # wf <METHOD> <component> <path> [body]
     fi
 }
 
+# The tunnel is asynchronous, and these two helpers are what that means for a caller.
+#
+# No request waits on a runtime. A read is accepted with 202 {"status":"FETCHING"} and
+# answered once some node's next heartbeat claims the fetch and posts the result; a mutation
+# is accepted with 202 {"operationId"} and its outcome is collected from operations/<id>.
+# Polling is therefore the contract, not a workaround for slowness -- asserting on the first
+# response tests the 202 and nothing else. Both helpers keep `wf`'s interface: the body lands
+# in /tmp/wf.out and the final HTTP code is printed, so assertions stay as they were.
+
+wf_read() {  # wf_read <component> <path> [budget_seconds]
+    local component="$1" path="$2" budget="${3:-60}" code waited=0
+    while :; do
+        code=$(wf GET "$component" "$path")
+        [ "$code" = "202" ] || { printf '%s' "$code"; return 0; }
+        [ "$waited" -ge "$budget" ] && { printf '%s' "$code"; return 0; }
+        sleep 2
+        waited=$((waited + 2))
+    done
+}
+
+wf_mutate() {  # wf_mutate <component> <path> <body> [budget_seconds]
+    local component="$1" path="$2" body="$3" budget="${4:-60}" code opid waited=0
+    code=$(wf POST "$component" "$path" "$body")
+    [ "$code" = "202" ] || { printf '%s' "$code"; return 0; }
+    opid=$(python3 -c 'import json
+try:
+    print(json.load(open("/tmp/wf.out")).get("operationId") or "")
+except Exception:
+    print("")')
+    [ -n "$opid" ] || { printf '%s' "$code"; return 0; }
+    while :; do
+        # 202 while PENDING or DELIVERED; then the operation's own status and body, or 504
+        # if no integration ever confirmed it.
+        code=$(wf GET "$component" "operations/${opid}")
+        [ "$code" = "202" ] || { printf '%s' "$code"; return 0; }
+        [ "$waited" -ge "$budget" ] && { printf '%s' "$code"; return 0; }
+        sleep 2
+        waited=$((waited + 2))
+    done
+}
+
 # ── 1 & 2. registration and promotion ────────────────────────────────────────
 # Read from Postgres: the GraphQL schema has no query that enumerates components, and the
 # columns here are exactly what the assertions are about — display_type is the promotion,
@@ -106,7 +147,7 @@ meta=$(docker compose exec -T postgres psql -qtAX -U "${POSTGRES_SUPERUSER:-post
 log "Workflow definitions (served from heartbeat metadata, no call into the runtime)"
 for pair in "expense:$EXPENSE_ID:expenseApproval,expenseAudit" "orders:$ORDERS_ID:orderFulfilment,orderReconciliation,bulkOrderIntake"; do
     label="${pair%%:*}"; rest="${pair#*:}"; cid="${rest%%:*}"; want="${rest#*:}"
-    code=$(wf GET "$cid" "definitions")
+    code=$(wf_read "$cid" "definitions")
     body=$(cat /tmp/wf.out)
     if [ "$code" = "200" ]; then
         names=$(printf '%s' "$body" | python3 -c 'import json,sys; d=json.load(sys.stdin); items=d if isinstance(d,list) else d.get("items",d.get("definitions",[])); print(",".join(sorted(i.get("name",i.get("workflowType","?")) for i in items)))' 2>/dev/null || echo "?")
@@ -121,7 +162,7 @@ done
 
 # ── 4 & 5. a full round trip through the tunnel ──────────────────────────────
 log "expenseApproval: start, find the human task, complete it"
-code=$(wf POST "$EXPENSE_ID" "workflows" \
+code=$(wf_mutate "$EXPENSE_ID" "workflows" \
     '{"workflowType":"expenseApproval","input":{"id":"EXP-SMOKE","amount":250,"submittedBy":"alice"}}')
 if [ "$code" = "201" ] || [ "$code" = "200" ]; then
     wfid=$(python3 -c 'import json,sys; d=json.load(open("/tmp/wf.out")); print(d.get("workflowId") or d.get("id") or "")')
@@ -137,7 +178,7 @@ if [ -n "$wfid" ]; then
     # workflow directly, so this needs no visibility support.
     status=""
     for i in $(seq 1 10); do
-        code=$(wf GET "$EXPENSE_ID" "workflows/${wfid}")
+        code=$(wf_read "$EXPENSE_ID" "workflows/${wfid}")
         status=$(python3 -c 'import json,sys
 try:
     print(json.load(open("/tmp/wf.out")).get("status",""))
@@ -155,7 +196,7 @@ except Exception:
     # (APPROVER here) or the page is correctly empty — scripts/grant-task-roles.sh.
     taskId=""
     for i in $(seq 1 10); do
-        code=$(wf GET "$EXPENSE_ID" "human-tasks?status=PENDING")
+        code=$(wf_read "$EXPENSE_ID" "human-tasks?status=PENDING")
         # This instance's task, not merely the first pending one: earlier runs leave their
         # own tasks pending, and completing one of those proves nothing about this workflow.
         taskId=$(python3 -c '
@@ -173,7 +214,7 @@ print(next((t["taskId"] for t in items if t.get("parentWorkflowId") == want), ""
     if [ -n "$taskId" ]; then
         ok "the ICP lists the pending human task ($taskId)"
 
-        code=$(wf GET "$EXPENSE_ID" "human-tasks/pending-count")
+        code=$(wf_read "$EXPENSE_ID" "human-tasks/pending-count")
         count=$(python3 -c 'import json,sys
 try:
     print(json.load(open("/tmp/wf.out")).get("count",0))
@@ -181,14 +222,14 @@ except Exception:
     print(0)')
         [ "${count:-0}" -ge 1 ] && ok "pending-count reports ${count}" || bad "pending-count reported ${count}"
 
-        code=$(wf POST "$EXPENSE_ID" "human-tasks/${taskId}/complete" '{"result":{"approved":true,"comment":"smoke"}}')
+        code=$(wf_mutate "$EXPENSE_ID" "human-tasks/${taskId}/complete" '{"result":{"approved":true,"comment":"smoke"}}')
         [ "$code" = "200" ] && ok "the task was completed through the tunnel" \
             || bad "complete returned $code: $(head -c 200 /tmp/wf.out)"
 
         # The workflow resumes, runs its activity and finishes.
         status=""
         for i in $(seq 1 15); do
-            code=$(wf GET "$EXPENSE_ID" "workflows/${wfid}")
+            code=$(wf_read "$EXPENSE_ID" "workflows/${wfid}")
             status=$(python3 -c 'import json,sys
 try:
     print(json.load(open("/tmp/wf.out")).get("status",""))
@@ -209,14 +250,14 @@ fi
 
 # ── 6. lifecycle on an event-parked instance ─────────────────────────────────
 log "orderFulfilment: lifecycle on an instance parked on an event"
-code=$(wf POST "$ORDERS_ID" "workflows" \
+code=$(wf_mutate "$ORDERS_ID" "workflows" \
     '{"workflowType":"orderFulfilment","input":{"orderId":"ORD-SMOKE","sku":"SKU-1","quantity":2}}')
 if [ "$code" = "201" ] || [ "$code" = "200" ]; then
     oid=$(python3 -c 'import json,sys; d=json.load(open("/tmp/wf.out")); print(d.get("workflowId") or d.get("id") or "")')
     ok "started (HTTP $code) workflowId=${oid:-<none>}"
     sleep 5
     for action in suspend resume terminate; do
-        code=$(wf POST "$ORDERS_ID" "workflows/${oid}/${action}" '{"reason":"smoke test"}')
+        code=$(wf_mutate "$ORDERS_ID" "workflows/${oid}/${action}" '{"reason":"smoke test"}')
         [ "$code" = "200" ] && ok "$action accepted" || bad "$action returned $code: $(head -c 200 /tmp/wf.out)"
         sleep 2
     done
@@ -230,11 +271,11 @@ if [ "$INCLUDE_OFFLINE" -eq 1 ]; then
     docker compose stop orders > /dev/null
     # Past heartbeatTimeoutSeconds the runtime is no longer RUNNING and no target qualifies.
     sleep 40
-    code=$(wf GET "$ORDERS_ID" "workflows")
+    code=$(wf_read "$ORDERS_ID" "workflows")
     [ "$code" = "503" ] \
         && ok "workflows answered 503 with the integration down" \
         || bad "workflows answered $code with the integration down (expected 503)"
-    code=$(wf GET "$ORDERS_ID" "definitions")
+    code=$(wf_read "$ORDERS_ID" "definitions")
     [ "$code" = "200" ] \
         && ok "definitions still answer 200 — they come from the database, not the runtime" \
         || bad "definitions answered $code with the integration down (expected 200)"
