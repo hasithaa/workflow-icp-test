@@ -51,9 +51,18 @@ INSERT INTO roles_v2 (role_id, role_name, org_id, description)
 SELECT gen_random_uuid()::text, 'APPROVER', 1, 'Workflow task role (test environment)'
  WHERE NOT EXISTS (SELECT 1 FROM roles_v2 WHERE role_name = 'APPROVER');
 
--- Viewer as well, or the approver signs in and can see no environment at all.
-INSERT INTO group_role_mapping (group_id, role_id)
-SELECT g.group_id, r.role_id
+-- org_uuid is what makes a grant count. Permission checks are scope-matched (org, project,
+-- environment, integration), and a mapping with every scope column NULL matches nothing: the
+-- user signs in, holds the role by name, and is still refused with 403. The shipped
+-- 'Super Admins' -> 'Super Admin' row is org-scoped, which is what to copy.
+--
+-- Note the two ideas that look alike here. Viewer is an ICP role carrying
+-- workflow_mgt:view_human_tasks, which is what the ICP authorizes on. APPROVER carries no
+-- permission at all -- it is a role NAME tunneled to the runtime, where the workflow's
+-- awaitHumanTask("approveExpense", "APPROVER", ...) decides task eligibility from it. A user
+-- needs Viewer to reach the page and APPROVER to see the task on it.
+INSERT INTO group_role_mapping (group_id, role_id, org_uuid)
+SELECT g.group_id, r.role_id, 1
   FROM user_groups g, roles_v2 r
  WHERE g.group_name = 'Approvers' AND r.role_name IN ('APPROVER', 'Viewer')
    AND NOT EXISTS (SELECT 1 FROM group_role_mapping m

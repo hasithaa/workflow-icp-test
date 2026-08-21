@@ -40,8 +40,8 @@ SELECT gen_random_uuid()::text, '${role}', 1, 'Workflow task role (test environm
  WHERE NOT EXISTS (SELECT 1 FROM roles_v2 WHERE role_name = '${role}');
 
 -- Granted to the group the console user belongs to, so its token carries the role.
-INSERT INTO group_role_mapping (group_id, role_id)
-SELECT g.group_id, r.role_id
+INSERT INTO group_role_mapping (group_id, role_id, org_uuid)
+SELECT g.group_id, r.role_id, 1
   FROM user_groups g, roles_v2 r
  WHERE g.group_name = '${GRANT_TO_GROUP}' AND r.role_name = '${role}'
    AND NOT EXISTS (
