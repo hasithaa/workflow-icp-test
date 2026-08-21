@@ -15,6 +15,16 @@ set -euo pipefail
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$HERE"
 
+# One file drives both compose and these scripts. Without this a port set in .env moves
+# where the containers publish but not where the scripts look, and bootstrap sits waiting
+# on a console that is answering somewhere else.
+if [ -f .env ]; then
+    set -a
+    # shellcheck disable=SC1091
+    . ./.env
+    set +a
+fi
+
 : "${POSTGRES_SUPERUSER:=postgres}"
 : "${ICP_DB_NAME:=icp_db}"
 : "${GRANT_TO_GROUP:=Super Admins}"

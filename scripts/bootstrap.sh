@@ -9,8 +9,37 @@ set -euo pipefail
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$HERE"
 
+# One file drives both compose and these scripts. Without this a port set in .env moves
+# where the containers publish but not where the scripts look, and bootstrap sits waiting
+# on a console that is answering somewhere else.
+if [ -f .env ]; then
+    set -a
+    # shellcheck disable=SC1091
+    . ./.env
+    set +a
+fi
+
 CLUSTER=0
 [ "${1:-}" = "--cluster" ] && CLUSTER=1
+
+# Two nodes means round-robin, which is the case the tunnel is built for; one node means the
+# pinned config, because nginx resolves upstreams at startup and a config naming icp-2 cannot
+# start without it. Set EDGE_CONF yourself to override either way.
+# The HTTP round-robin config terminates TLS at the edge, so it needs a certificate of its
+# own. Self-signed, and regenerating is harmless: nothing pins it, and both the browser and
+# the integrations skip verification because the distribution's certificate is self-signed too.
+mkdir -p edge/certs
+if [ ! -f edge/certs/edge.crt ]; then
+    openssl req -x509 -newkey rsa:2048 -nodes -keyout edge/certs/edge.key \
+        -out edge/certs/edge.crt -days 825 -subj "/CN=localhost" \
+        -addext "subjectAltName=DNS:localhost,DNS:edge,IP:127.0.0.1" 2>/dev/null
+    echo "generated edge/certs/edge.crt"
+fi
+
+if [ "$CLUSTER" -eq 1 ] && [ -z "${EDGE_CONF:-}" ]; then
+    EDGE_CONF=nginx.roundrobin.conf
+    export EDGE_CONF
+fi
 
 : "${CONSOLE_PORT:=9446}"
 : "${ICP_ADMIN_USER:=admin}"
@@ -29,6 +58,12 @@ log "Starting Postgres, the ICP node(s) and the edge proxy"
 # while we bring up only the control-plane half.
 ICP_EXPENSE_SECRET=bootstrap ICP_ORDERS_SECRET=bootstrap "${COMPOSE[@]}" up -d --build postgres icp-1 edge
 [ "$CLUSTER" -eq 1 ] && ICP_EXPENSE_SECRET=bootstrap ICP_ORDERS_SECRET=bootstrap "${COMPOSE[@]}" up -d --build icp-2
+# Recreated after icp-2 exists: nginx resolved its upstreams when it first started, so an
+# edge that came up alongside a single node cannot see the second one. The placeholder
+# secrets are needed for the same reason as above — compose interpolates the whole file, so
+# the integrations' required ICP_*_SECRET must have *a* value even when starting the edge.
+[ "$CLUSTER" -eq 1 ] && ICP_EXPENSE_SECRET=bootstrap ICP_ORDERS_SECRET=bootstrap \
+    "${COMPOSE[@]}" up -d --force-recreate edge
 
 log "Waiting for the console to answer on ${CONSOLE}"
 for i in $(seq 1 60); do
