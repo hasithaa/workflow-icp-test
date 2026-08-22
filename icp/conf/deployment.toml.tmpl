@@ -17,6 +17,13 @@ enableMetrics = true
 
 schedulerIntervalSeconds = 60
 
+# How often unanswered fetches are given up on and unconfirmed operations are expired.
+# The default is 300s. Lowered here so the give-up paths are testable in seconds instead of
+# minutes — scripts/edge-cases.sh A11 waits for exactly this. It is a test-environment
+# setting: sweeping this often in production would be pointless work, since the deadlines it
+# enforces are measured in minutes.
+workflowSweepIntervalSeconds = 30
+
 # The default auth backend's user store. A separate database, not a schema inside icp_db:
 # the credentials client sets no schema, so its tables must sit on the default search_path
 # of the database named here.

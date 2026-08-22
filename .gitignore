@@ -15,3 +15,4 @@ integrations/*/Dependencies.toml
 .DS_Store
 # Clones made by scripts/build-artifacts.sh when no local checkout is present.
 .sources/
+edge/certs/

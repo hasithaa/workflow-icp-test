@@ -15,6 +15,16 @@ set -euo pipefail
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$HERE"
 
+# One file drives both compose and these scripts. Without this a port set in .env moves
+# where the containers publish but not where the scripts look, and bootstrap sits waiting
+# on a console that is answering somewhere else.
+if [ -f .env ]; then
+    set -a
+    # shellcheck disable=SC1091
+    . ./.env
+    set +a
+fi
+
 : "${POSTGRES_SUPERUSER:=postgres}"
 : "${ICP_DB_NAME:=icp_db}"
 : "${GRANT_TO_GROUP:=Super Admins}"
@@ -30,8 +40,8 @@ SELECT gen_random_uuid()::text, '${role}', 1, 'Workflow task role (test environm
  WHERE NOT EXISTS (SELECT 1 FROM roles_v2 WHERE role_name = '${role}');
 
 -- Granted to the group the console user belongs to, so its token carries the role.
-INSERT INTO group_role_mapping (group_id, role_id)
-SELECT g.group_id, r.role_id
+INSERT INTO group_role_mapping (group_id, role_id, org_uuid)
+SELECT g.group_id, r.role_id, 1
   FROM user_groups g, roles_v2 r
  WHERE g.group_name = '${GRANT_TO_GROUP}' AND r.role_name = '${role}'
    AND NOT EXISTS (

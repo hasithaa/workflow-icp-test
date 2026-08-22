@@ -18,6 +18,16 @@ set -euo pipefail
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$HERE"
 
+# One file drives both compose and these scripts. Without this a port set in .env moves
+# where the containers publish but not where the scripts look, and bootstrap sits waiting
+# on a console that is answering somewhere else.
+if [ -f .env ]; then
+    set -a
+    # shellcheck disable=SC1091
+    . ./.env
+    set +a
+fi
+
 : "${CONSOLE_PORT:=9446}"
 : "${ICP_ADMIN_USER:=admin}"
 : "${ICP_ADMIN_PASSWORD:=admin}"
@@ -39,18 +49,8 @@ token=$(curl -sk -X POST "${CONSOLE}/auth/login" -H 'Content-Type: application/j
     | jqp 'd.get("token","")')
 [ -n "$token" ] || { echo "login failed" >&2; exit 1; }
 
-wf() {  # wf <METHOD> <component> <path> [body]
-    local method="$1" component="$2" path="$3" body="${4:-}"
-    if [ -n "$body" ]; then
-        curl -sk -o /tmp/wf.out -w '%{http_code}' -X "$method" \
-            "${CONSOLE}/icp/workflow/${component}/${ICP_ENVIRONMENT_ID}/${path}" \
-            -H 'Content-Type: application/json' -H "Authorization: Bearer ${token}" -d "$body"
-    else
-        curl -sk -o /tmp/wf.out -w '%{http_code}' -X "$method" \
-            "${CONSOLE}/icp/workflow/${component}/${ICP_ENVIRONMENT_ID}/${path}" \
-            -H "Authorization: Bearer ${token}"
-    fi
-}
+# shellcheck source=scripts/lib-wf.sh
+. "${HERE}/scripts/lib-wf.sh"
 
 # ── 1 & 2. registration and promotion ────────────────────────────────────────
 # Read from Postgres: the GraphQL schema has no query that enumerates components, and the
@@ -96,7 +96,7 @@ meta=$(docker compose exec -T postgres psql -qtAX -U "${POSTGRES_SUPERUSER:-post
 log "Workflow definitions (served from heartbeat metadata, no call into the runtime)"
 for pair in "expense:$EXPENSE_ID:expenseApproval,expenseAudit" "orders:$ORDERS_ID:orderFulfilment,orderReconciliation,bulkOrderIntake"; do
     label="${pair%%:*}"; rest="${pair#*:}"; cid="${rest%%:*}"; want="${rest#*:}"
-    code=$(wf GET "$cid" "definitions")
+    code=$(wf_read "$cid" "definitions")
     body=$(cat /tmp/wf.out)
     if [ "$code" = "200" ]; then
         names=$(printf '%s' "$body" | python3 -c 'import json,sys; d=json.load(sys.stdin); items=d if isinstance(d,list) else d.get("items",d.get("definitions",[])); print(",".join(sorted(i.get("name",i.get("workflowType","?")) for i in items)))' 2>/dev/null || echo "?")
@@ -111,7 +111,7 @@ done
 
 # ── 4 & 5. a full round trip through the tunnel ──────────────────────────────
 log "expenseApproval: start, find the human task, complete it"
-code=$(wf POST "$EXPENSE_ID" "workflows" \
+code=$(wf_mutate "$EXPENSE_ID" "workflows" \
     '{"workflowType":"expenseApproval","input":{"id":"EXP-SMOKE","amount":250,"submittedBy":"alice"}}')
 if [ "$code" = "201" ] || [ "$code" = "200" ]; then
     wfid=$(python3 -c 'import json,sys; d=json.load(open("/tmp/wf.out")); print(d.get("workflowId") or d.get("id") or "")')
@@ -127,7 +127,7 @@ if [ -n "$wfid" ]; then
     # workflow directly, so this needs no visibility support.
     status=""
     for i in $(seq 1 10); do
-        code=$(wf GET "$EXPENSE_ID" "workflows/${wfid}")
+        code=$(wf_read "$EXPENSE_ID" "workflows/${wfid}")
         status=$(python3 -c 'import json,sys
 try:
     print(json.load(open("/tmp/wf.out")).get("status",""))
@@ -145,7 +145,7 @@ except Exception:
     # (APPROVER here) or the page is correctly empty — scripts/grant-task-roles.sh.
     taskId=""
     for i in $(seq 1 10); do
-        code=$(wf GET "$EXPENSE_ID" "human-tasks?status=PENDING")
+        code=$(wf_read "$EXPENSE_ID" "human-tasks?status=PENDING")
         # This instance's task, not merely the first pending one: earlier runs leave their
         # own tasks pending, and completing one of those proves nothing about this workflow.
         taskId=$(python3 -c '
@@ -163,7 +163,7 @@ print(next((t["taskId"] for t in items if t.get("parentWorkflowId") == want), ""
     if [ -n "$taskId" ]; then
         ok "the ICP lists the pending human task ($taskId)"
 
-        code=$(wf GET "$EXPENSE_ID" "human-tasks/pending-count")
+        code=$(wf_read "$EXPENSE_ID" "human-tasks/pending-count")
         count=$(python3 -c 'import json,sys
 try:
     print(json.load(open("/tmp/wf.out")).get("count",0))
@@ -171,14 +171,14 @@ except Exception:
     print(0)')
         [ "${count:-0}" -ge 1 ] && ok "pending-count reports ${count}" || bad "pending-count reported ${count}"
 
-        code=$(wf POST "$EXPENSE_ID" "human-tasks/${taskId}/complete" '{"result":{"approved":true,"comment":"smoke"}}')
+        code=$(wf_mutate "$EXPENSE_ID" "human-tasks/${taskId}/complete" '{"result":{"approved":true,"comment":"smoke"}}')
         [ "$code" = "200" ] && ok "the task was completed through the tunnel" \
             || bad "complete returned $code: $(head -c 200 /tmp/wf.out)"
 
         # The workflow resumes, runs its activity and finishes.
         status=""
         for i in $(seq 1 15); do
-            code=$(wf GET "$EXPENSE_ID" "workflows/${wfid}")
+            code=$(wf_read "$EXPENSE_ID" "workflows/${wfid}")
             status=$(python3 -c 'import json,sys
 try:
     print(json.load(open("/tmp/wf.out")).get("status",""))
@@ -199,14 +199,14 @@ fi
 
 # ── 6. lifecycle on an event-parked instance ─────────────────────────────────
 log "orderFulfilment: lifecycle on an instance parked on an event"
-code=$(wf POST "$ORDERS_ID" "workflows" \
+code=$(wf_mutate "$ORDERS_ID" "workflows" \
     '{"workflowType":"orderFulfilment","input":{"orderId":"ORD-SMOKE","sku":"SKU-1","quantity":2}}')
 if [ "$code" = "201" ] || [ "$code" = "200" ]; then
     oid=$(python3 -c 'import json,sys; d=json.load(open("/tmp/wf.out")); print(d.get("workflowId") or d.get("id") or "")')
     ok "started (HTTP $code) workflowId=${oid:-<none>}"
     sleep 5
     for action in suspend resume terminate; do
-        code=$(wf POST "$ORDERS_ID" "workflows/${oid}/${action}" '{"reason":"smoke test"}')
+        code=$(wf_mutate "$ORDERS_ID" "workflows/${oid}/${action}" '{"reason":"smoke test"}')
         [ "$code" = "200" ] && ok "$action accepted" || bad "$action returned $code: $(head -c 200 /tmp/wf.out)"
         sleep 2
     done
@@ -220,11 +220,11 @@ if [ "$INCLUDE_OFFLINE" -eq 1 ]; then
     docker compose stop orders > /dev/null
     # Past heartbeatTimeoutSeconds the runtime is no longer RUNNING and no target qualifies.
     sleep 40
-    code=$(wf GET "$ORDERS_ID" "workflows")
+    code=$(wf_read "$ORDERS_ID" "workflows")
     [ "$code" = "503" ] \
         && ok "workflows answered 503 with the integration down" \
         || bad "workflows answered $code with the integration down (expected 503)"
-    code=$(wf GET "$ORDERS_ID" "definitions")
+    code=$(wf_read "$ORDERS_ID" "definitions")
     [ "$code" = "200" ] \
         && ok "definitions still answer 200 — they come from the database, not the runtime" \
         || bad "definitions answered $code with the integration down (expected 200)"

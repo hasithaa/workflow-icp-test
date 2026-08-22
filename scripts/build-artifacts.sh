@@ -89,6 +89,11 @@ resolve_repo() {
         git clone --quiet "$url" "$dest"
     fi
 
+    # Building stamps files inside the clone — Ballerina rewrites Dependencies.toml — and a
+    # dirty tree blocks the next checkout. This is a build input, not a working tree, so its
+    # local changes are discarded rather than protected.
+    git -C "$dest" reset --hard --quiet HEAD
+
     # Checked explicitly, because a failure here is the one that must not be survivable: a
     # missing ref used to leave the previous checkout in place while the log still announced
     # the ref that was asked for, so the build produced the wrong artifacts and said nothing.
@@ -127,11 +132,16 @@ fi
 log "Staging the ICP SQL scripts"
 cp "$ICP_REPO/icp_server/resources/db/init-scripts/postgresql_init.sql" artifacts/db/
 cp "$ICP_REPO/icp_server/resources/db/init-scripts/credentials_postgresql_init.sql" artifacts/db/
-cp "$ICP_REPO/icp_server/resources/db/migration-scripts/add_workflow_feature_postgresql.sql" artifacts/db/
-# The tunnel's tables. A fresh database gets them from postgresql_init.sql; this is the
-# script an existing deployment runs, staged so that path can be exercised here too.
-cp "$ICP_REPO/icp_server/resources/db/migration-scripts/add_workflow_tunnel_postgresql.sql" artifacts/db/ 2>/dev/null \
-    || echo "note: no add_workflow_tunnel_postgresql.sql in this ICP ref (pre-cache-table branch)"
+# Every PostgreSQL migration the ref ships, by glob rather than by name. A fresh database
+# gets its schema from postgresql_init.sql; these are the scripts an existing deployment
+# runs, staged so that path can be exercised here too. Naming one file explicitly means a
+# rename upstream stages nothing and reports it as the branch being old -- which is how
+# add_workflow_tunnel_*.sql kept "succeeding" after it became add_cache_tables_*.sql.
+# Stale copies are cleared first so a rename cannot leave both names in place.
+rm -f artifacts/db/add_*_postgresql.sql
+migrations=("$ICP_REPO"/icp_server/resources/db/migration-scripts/*_postgresql.sql)
+[ -e "${migrations[0]}" ] || { echo "no *_postgresql.sql migrations in $ICP_REF" >&2; exit 1; }
+cp "${migrations[@]}" artifacts/db/
 echo "staged artifacts/db: $(ls artifacts/db | tr '\n' ' ')"
 
 # ── 3. Dependencies into the local bala repository ────────────────────────────
