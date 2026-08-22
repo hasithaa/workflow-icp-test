@@ -566,6 +566,70 @@ print(next((i.get("status", "") for i in items if i.get("workflowId") == want), 
     fi
 fi
 
+# ── A15. A late result cannot resurrect an invalidated row ───────────────────
+# The fencing story: a command id carries the attempt that asked for it, so an answer whose
+# attempt the row no longer holds belongs to a superseded or invalidated fetch and must be
+# thrown away. Without this, a slow runtime's reply lands after a mutation invalidated the
+# entry and re-caches pre-mutation state for a full TTL — the user completes a task, watches it
+# reappear, and the cache insists for minutes.
+#
+# Posted through the real /icp/commandResult with a real runtime JWT (scripts/late-result.py),
+# so the ICP rejects it on its merits rather than because the call was malformed.
+if [ "$WANT" = "all" ] || [ "$WANT" = "A15" ]; then
+    log "A15 — a result for a superseded attempt must be discarded"
+
+    token="$ADMIN_TOKEN"
+    probe="human-tasks?status=PENDING&taskName=a15-$(date +%H%M%S)"
+    code=$(wf GET "$EXPENSE_ID" "$probe")
+    if [ "$code" != "202" ]; then
+        bad "the probe read did not start a fetch (HTTP ${code})"
+    else
+        row=$(psql_q "SELECT cache_key || ':' || coalesce(token,'') FROM cache_entry
+                       WHERE status = 'FETCHING' ORDER BY created_at DESC LIMIT 1")
+        cache_key="${row%%:*}"; stale_token="${row##*:}"
+        if [ -z "$cache_key" ] || [ -z "$stale_token" ]; then
+            note "the fetch was answered before it could be superseded — rerun for this case"
+            note "(the runtime beat the test, which is not a failure of the fencing)"
+        else
+            note "attempt ${stale_token} on ${cache_key:0:16}…"
+
+            # Supersede it exactly as a re-claim would: a new attempt token on the same row.
+            new_token="a15-superseded-$(date +%s)"
+            psql_q "UPDATE cache_entry SET token = '${new_token}' WHERE cache_key = '${cache_key}'" >/dev/null
+            ok "the row now belongs to a newer attempt"
+
+            runtime=$(psql_q "SELECT m.runtime_id FROM bi_workflow_metadata m
+                              JOIN runtimes r ON r.runtime_id = m.runtime_id
+                             WHERE r.component_id = '${EXPENSE_ID}' AND r.status = 'RUNNING' LIMIT 1")
+            marker="a15-must-not-be-cached"
+            out=$(ICP_ORG_SECRET="${ICP_EXPENSE_SECRET}" ICP_RUNTIME_URL="https://localhost:${RUNTIME_PORT:-9445}" \
+                python3 scripts/late-result.py "$runtime" "wfr-${cache_key}.${stale_token}" 200 \
+                "{\"items\":[{\"taskId\":\"${marker}\"}]}" 2>&1)
+            note "the ICP answered: ${out}"
+
+            # Accepting the POST is fine — the runtime did its job and the transport worked.
+            # What must not happen is the payload being stored.
+            stored=$(psql_q "SELECT count(*) FROM cache_entry
+                              WHERE cache_key = '${cache_key}' AND data LIKE '%${marker}%'")
+            [ "${stored:-0}" = "0" ] \
+                && ok "the superseded answer was not stored" \
+                || bad "the superseded answer WAS stored — a late reply can resurrect an invalidated row"
+
+            held=$(psql_q "SELECT coalesce(token,'') FROM cache_entry WHERE cache_key = '${cache_key}'")
+            [ "$held" = "$new_token" ] \
+                && ok "the row still belongs to the newer attempt" \
+                || note "the row's attempt is now '${held}'"
+
+            code=$(wf GET "$EXPENSE_ID" "$probe")
+            body=$(head -c 200 /tmp/wf.out)
+            case "$body" in
+                *"$marker"*) bad "a reader was served the superseded payload" ;;
+                *) ok "a reader is not served it either (HTTP ${code})" ;;
+            esac
+        fi
+    fi
+fi
+
 # ── A17. Exactly one outcome record per operation ────────────────────────────
 # Four workers heartbeat independently and a result can be redelivered, so "record the
 # outcome" must be idempotent. Two nodes seeing the same result must not both write it.
