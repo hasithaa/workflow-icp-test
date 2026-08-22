@@ -5,7 +5,7 @@
 # node, or two things happening at once. Each prints ok/FAIL and the script exits non-zero if
 # any failed, so it can gate a change rather than being eyeballed.
 #
-# Usage: scripts/edge-cases.sh [A1|A3|A4|A17|all]
+# Usage: scripts/edge-cases.sh [A1|A3|A4|A11|A13|A17|all]
 set -uo pipefail
 
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
@@ -36,6 +36,7 @@ CONSOLE="https://localhost:${CONSOLE_PORT}"
 . "${HERE}/scripts/lib-wf.sh"
 
 WANT="${1:-all}"
+psql_q() { docker compose exec -T postgres psql -qtAX -U "${POSTGRES_SUPERUSER:-postgres}" -d "${ICP_DB_NAME:-icp_db}" -c "$1" 2>/dev/null | tr -d ' '; }
 PASS=0 FAIL=0
 log() { printf '\n=== %s\n' "$*"; }
 ok() { printf '  ok    %s\n' "$*"; PASS=$((PASS+1)); }
@@ -236,6 +237,104 @@ except Exception:
     fi
 fi
 
+# ── A3b. Two users deciding DIFFERENTLY on one task ──────────────────────────
+# A3 shows a lost race being reported inconsistently — 500 on one run, 200 on the next,
+# depending on whether the second signal arrives before the task workflow closes. This asks the
+# question that makes the ambiguity matter: one user approves, the other rejects. Only one
+# decision can take effect. If both callers are told 200, one of them believes they decided
+# something they did not, and nothing in the response says which way it went.
+if [ "$WANT" = "all" ] || [ "$WANT" = "A3b" ]; then
+    log "A3b — one approves, one rejects, at the same time"
+
+    token="$ADMIN_TOKEN"
+    stamp=$(date +%H%M%S)
+    code=$(wf_mutate "$EXPENSE_ID" "workflows" \
+        "{\"workflowType\":\"expenseApproval\",\"input\":{\"id\":\"EXP-SPLIT-${stamp}\",\"amount\":555,\"submittedBy\":\"split\"}}" 120)
+    wfid=$(python3 -c 'import json; print(json.load(open("/tmp/wf.out")).get("workflowId",""))' 2>/dev/null)
+    taskId=""
+    if [ -n "$wfid" ]; then
+        for _ in $(seq 1 12); do
+            code=$(wf_read "$EXPENSE_ID" "human-tasks?status=PENDING" 90)
+            taskId=$(python3 -c '
+import json, sys
+want = sys.argv[1]
+try:
+    items = json.load(open("/tmp/wf.out")).get("items", [])
+except Exception:
+    items = []
+print(next((t["taskId"] for t in items if t.get("parentWorkflowId") == want), ""))
+' "$wfid")
+            [ -n "$taskId" ] && break
+            sleep 3
+        done
+    fi
+
+    if [ -z "$taskId" ]; then
+        bad "could not prepare a task for the split-decision case"
+    else
+        note "task ${taskId} on instance ${wfid}"
+        tm1_token=$(token_for "$TM1_USER" "$TM1_PASSWORD")
+        tm2_token=$(token_for "$TM2_USER" "$TM2_PASSWORD")
+
+        (
+            token="$tm1_token" WF_OUT=/tmp/wf-s1.out
+            c=$(wf_mutate "$EXPENSE_ID" "human-tasks/${taskId}/complete" \
+                '{"result":{"approved":true,"comment":"approve"}}' 120)
+            printf '%s' "$c" > /tmp/split_yes
+        ) &
+        (
+            token="$tm2_token" WF_OUT=/tmp/wf-s2.out
+            c=$(wf_mutate "$EXPENSE_ID" "human-tasks/${taskId}/complete" \
+                '{"result":{"approved":false,"comment":"reject"}}' 120)
+            printf '%s' "$c" > /tmp/split_no
+        ) &
+        wait
+        token="$ADMIN_TOKEN"
+
+        yes=$(cat /tmp/split_yes 2>/dev/null)
+        no=$(cat /tmp/split_no 2>/dev/null)
+        note "approve=${yes} reject=${no}"
+
+        # The workflow returns an error when rejected, so its final status tells us which
+        # decision actually took effect: COMPLETED means approve won, FAILED means reject did.
+        status=""
+        for _ in $(seq 1 20); do
+            code=$(wf_read "$EXPENSE_ID" "workflows/${wfid}" 90)
+            status=$(python3 -c '
+import json
+try:
+    print(json.load(open("/tmp/wf.out")).get("status",""))
+except Exception:
+    print("")')
+            case "$status" in COMPLETED|FAILED|TERMINATED) break ;; esac
+            sleep 3
+        done
+        case "$status" in
+            COMPLETED) note "the approval took effect" ;;
+            FAILED)    note "the rejection took effect" ;;
+            *)         note "the instance is '${status}'" ;;
+        esac
+        case "$status" in
+            COMPLETED|FAILED) ok "exactly one decision took effect (instance ${status})" ;;
+            *) bad "the instance never settled (${status})" ;;
+        esac
+
+        # The point of the case: was the user whose decision was discarded told so?
+        told=0
+        for c in "$yes" "$no"; do
+            case "$c" in 2*) told=$((told+1)) ;; esac
+        done
+        if [ "$told" = "2" ]; then
+            bad "both users were told their decision succeeded, but only one did — a silent lost update"
+            note "whichever of them lost has no way to know: same status, same body shape"
+        elif [ "$told" = "1" ]; then
+            ok "one user was told it succeeded and the other was not"
+        else
+            bad "neither user was told their decision succeeded (${yes}/${no})"
+        fi
+    fi
+fi
+
 # ── A4. Node independence ────────────────────────────────────────────────────
 # The row is the queue, so no node owns a request. This kills the node that accepted a read
 # while that read is still in flight: another node's heartbeat must claim it, deliver it, and
@@ -272,6 +371,198 @@ if [ "$WANT" = "all" ] || [ "$WANT" = "A4" ]; then
         [ "${up:-0}" = "1" ] \
             && ok "icp-1 rejoined with no state to rebuild" \
             || bad "icp-1 did not come back up"
+    fi
+fi
+
+# ── A11. A mutation whose target dies ────────────────────────────────────────
+# The outbox addresses ONE runtime. If that runtime never confirms, the operation must end
+# EXPIRED and say so — and must never be re-run somewhere else. Re-running is the tempting
+# repair and the wrong one: the ICP cannot know whether the original took effect, and a
+# completion applied twice is worse than one reported as unconfirmed.
+#
+# Sequencing matters. The workers are stopped first, but the mutation is submitted while their
+# rows still read RUNNING (within heartbeatTimeoutSeconds) — otherwise target selection fails
+# and the ICP refuses the request with 503, which is a different path entirely.
+if [ "$WANT" = "all" ] || [ "$WANT" = "A11" ]; then
+    log "A11 — a mutation whose target dies before confirming"
+
+    token="$ADMIN_TOKEN"
+    stamp=$(date +%H%M%S)
+    code=$(wf_mutate "$EXPENSE_ID" "workflows" \
+        "{\"workflowType\":\"expenseApproval\",\"input\":{\"id\":\"EXP-DEAD-${stamp}\",\"amount\":31,\"submittedBy\":\"dead\"}}" 120)
+    wfid=$(python3 -c 'import json; print(json.load(open("/tmp/wf.out")).get("workflowId",""))' 2>/dev/null)
+    taskId=""
+    if [ -n "$wfid" ]; then
+        for _ in $(seq 1 12); do
+            code=$(wf_read "$EXPENSE_ID" "human-tasks?status=PENDING" 90)
+            taskId=$(python3 -c '
+import json, sys
+want = sys.argv[1]
+try:
+    items = json.load(open("/tmp/wf.out")).get("items", [])
+except Exception:
+    items = []
+print(next((t["taskId"] for t in items if t.get("parentWorkflowId") == want), ""))
+' "$wfid")
+            [ -n "$taskId" ] && break
+            sleep 3
+        done
+    fi
+
+    if [ -z "$taskId" ]; then
+        bad "could not prepare a pending task for the dead-target case"
+    else
+        note "task ${taskId} on instance ${wfid}"
+        docker compose stop expense >/dev/null 2>&1
+        note "both expense workers stopped; their runtime rows still read RUNNING for now"
+
+        # Queued, not delivered: nothing is listening on that task queue any more.
+        code=$(wf POST "$EXPENSE_ID" "human-tasks/${taskId}/complete" '{"result":{"approved":true,"comment":"dead-target"}}')
+        opid=$(python3 -c 'import json
+try:
+    print(json.load(open("/tmp/wf.out")).get("operationId") or "")
+except Exception:
+    print("")')
+        if [ "$code" != "202" ] || [ -z "$opid" ]; then
+            bad "the mutation was not queued (HTTP ${code}) — the runtimes were already OFFLINE, so this tested nothing"
+        else
+            ok "the mutation was accepted and queued as ${opid}"
+
+            # Its real deadline is 30 minutes. Brought forward so the give-up path runs now;
+            # the sweep interval is 30s in this environment for the same reason.
+            psql_q "UPDATE cache_operation_outbox SET deadline = extract(epoch from now())::bigint - 5 WHERE operation_id = '${opid}'" >/dev/null
+            note "deadline brought forward; waiting for a sweep"
+
+            status=""
+            for _ in $(seq 1 20); do
+                status=$(psql_q "SELECT status FROM cache_operation_outbox WHERE operation_id = '${opid}'")
+                [ "$status" = "EXPIRED" ] && break
+                sleep 5
+            done
+            [ "$status" = "EXPIRED" ] \
+                && ok "the sweep expired the unconfirmed operation" \
+                || bad "the operation is '${status}' — the sweep did not give up on it"
+
+            # The caller polling it must be told what is and is not known.
+            code=$(wf GET "$EXPENSE_ID" "operations/${opid}")
+            body=$(head -c 300 /tmp/wf.out)
+            case "$code" in
+                504) ok "polling it answers 504" ;;
+                *)   bad "polling it answered ${code}" ;;
+            esac
+            case "$body" in
+                *"not confirm"*|*"may or may not"*) ok "and says the outcome is unconfirmed, not that it failed" ;;
+                *) bad "the message does not say the outcome is unknown: ${body}" ;;
+            esac
+
+            # An operator has to be able to find it. A 5xx or an expiry raises an unresolved
+            # notification precisely because nobody knows whether the action took effect.
+            # metadata is jsonb, so LIKE needs the cast. Without it the query errors, psql_q
+            # swallows stderr, and the empty result reads as "no notification" — the assertion
+            # failing rather than the thing it asserts.
+            events=$(psql_q "SELECT count(*) FROM system_events WHERE metadata::text LIKE '%${opid}%'")
+            [ "${events:-0}" -ge 1 ] \
+                && ok "an operator notification was raised (${events})" \
+                || bad "no notification names this operation — it disappeared silently"
+
+            docker compose start expense >/dev/null 2>&1
+            note "workers restarted; watching for a re-delivery that must not happen"
+            sleep 25
+
+            redelivered=$(docker compose logs --since 40s expense 2>/dev/null | grep -c "$opid" || true)
+            [ "${redelivered:-0}" = "0" ] \
+                && ok "the expired operation was not re-delivered" \
+                || bad "the expired operation was delivered ${redelivered} time(s) after expiry"
+
+            final=$(psql_q "SELECT status FROM cache_operation_outbox WHERE operation_id = '${opid}'")
+            [ "$final" = "EXPIRED" ] \
+                && ok "it stayed EXPIRED after the target came back" \
+                || bad "its status became '${final}' after the target came back"
+
+            # And the action itself must not have happened.
+            still_pending=$(wf_read "$EXPENSE_ID" "human-tasks?status=PENDING&refresh=true" 120 >/dev/null; python3 -c '
+import json, sys
+want = sys.argv[1]
+try:
+    items = json.load(open("/tmp/wf.out")).get("items", [])
+except Exception:
+    items = []
+print("yes" if any(t.get("taskId") == want for t in items) else "no")
+' "$taskId")
+            [ "$still_pending" = "yes" ] \
+                && ok "the task is still pending — the unconfirmed completion was not applied" \
+                || note "the task is no longer pending; it may have been completed by another case in this run"
+        fi
+    fi
+fi
+
+# ── A13. A change made outside the ICP becomes visible ───────────────────────
+# Nothing guarantees every change arrives through the tunnel. An operator with the Temporal CLI,
+# another tool, or the workflow itself can move an instance, and the console must catch up
+# rather than serving its cached answer indefinitely. This terminates an instance behind the
+# ICP's back and waits for the listing to notice.
+if [ "$WANT" = "all" ] || [ "$WANT" = "A13" ]; then
+    log "A13 — an instance terminated outside the ICP must become visible"
+
+    token="$ADMIN_TOKEN"
+    code=$(wf_read "$ORDERS_ID" "workflows?limit=100" 120)
+    victim=$(python3 -c '
+import json
+try:
+    items = json.load(open("/tmp/wf.out")).get("items", [])
+except Exception:
+    items = []
+# An event-parked orderFulfilment: RUNNING and staying that way until something moves it.
+print(next((i["workflowId"] for i in items
+            if i.get("status") == "RUNNING" and i.get("workflowType") == "orderFulfilment"), ""))
+')
+    if [ -z "$victim" ]; then
+        bad "no RUNNING orderFulfilment instance to terminate — run scripts/populate.sh"
+    else
+        note "terminating ${victim} with the Temporal CLI, not through the ICP"
+        docker compose exec -T temporal temporal workflow terminate \
+            --address temporal:7233 --namespace default \
+            --workflow-id "$victim" --reason "A13 external change" >/dev/null 2>&1
+        killed=$?
+        [ "$killed" = "0" ] \
+            && ok "the CLI terminated it" \
+            || bad "the CLI could not terminate it"
+
+        # No refresh, no cache-busting: the question is whether an ordinary reader finds out.
+        # The bound is the listing TTL plus a heartbeat, so this waits rather than polling once.
+        seen=""
+        for _ in $(seq 1 24); do
+            code=$(wf_read "$ORDERS_ID" "workflows?limit=100" 120)
+            seen=$(python3 -c '
+import json, sys
+want = sys.argv[1]
+try:
+    items = json.load(open("/tmp/wf.out")).get("items", [])
+except Exception:
+    items = []
+print(next((i.get("status", "") for i in items if i.get("workflowId") == want), ""))
+' "$victim")
+            [ "$seen" = "TERMINATED" ] && break
+            sleep 5
+        done
+        [ "$seen" = "TERMINATED" ] \
+            && ok "an unforced read reports it TERMINATED — the cache caught up on its own" \
+            || bad "the listing still reports '${seen}' after ~2 minutes"
+
+        # And the explicit refresh must not be slower than waiting.
+        code=$(wf_read "$ORDERS_ID" "workflows?limit=100&refresh=true" 120)
+        forced=$(python3 -c '
+import json, sys
+want = sys.argv[1]
+try:
+    items = json.load(open("/tmp/wf.out")).get("items", [])
+except Exception:
+    items = []
+print(next((i.get("status", "") for i in items if i.get("workflowId") == want), ""))
+' "$victim")
+        [ "$forced" = "TERMINATED" ] \
+            && ok "a forced refresh agrees" \
+            || bad "a forced refresh reports '${forced}'"
     fi
 fi
 
