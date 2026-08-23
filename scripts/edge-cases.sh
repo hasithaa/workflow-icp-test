@@ -630,6 +630,71 @@ if [ "$WANT" = "all" ] || [ "$WANT" = "A15" ]; then
     fi
 fi
 
+# ── A19. An expiring entry must not stampede ─────────────────────────────────
+# The cold-cache case is covered by concurrent.sh: many callers, one fetch. This is the other
+# one, and it behaves differently — the entry EXISTS and has just expired, so every caller has
+# something to be served while exactly one refresh should be issued behind it. Getting this
+# wrong is how a popular view turns into one command per viewer at every TTL boundary.
+if [ "$WANT" = "all" ] || [ "$WANT" = "A19" ]; then
+    log "A19 — an entry expiring under many readers issues one refresh"
+
+    token="$ADMIN_TOKEN"
+    probe="workflows?limit=50"
+    # Warm it first: this case is about an entry that exists.
+    code=$(wf_read "$EXPENSE_ID" "$probe" 120)
+    if [ "$code" != "200" ]; then
+        bad "could not warm the entry (HTTP ${code})"
+    else
+        key=$(psql_q "SELECT cache_key FROM cache_entry WHERE status = 'READY'
+                       AND data LIKE '%instances.list%' ORDER BY created_at DESC LIMIT 1")
+        if [ -z "$key" ]; then
+            bad "the warmed entry could not be identified"
+        else
+            ok "the entry is warm (${key:0:16}…)"
+            psql_q "UPDATE cache_entry SET expires_at = extract(epoch from now())::bigint - 1,
+                           token = NULL, claimed_at = NULL WHERE cache_key = '${key}'" >/dev/null
+            note "expired it; releasing 12 concurrent readers"
+
+            before=$(docker compose logs --tail=2000 expense 2>/dev/null | grep -c "Handling control command" || true)
+            for i in $(seq 1 12); do
+                (
+                    WF_OUT="/tmp/burst-${i}.out"
+                    export WF_OUT
+                    c=$(wf GET "$EXPENSE_ID" "$probe")
+                    printf '%s' "$c" > "/tmp/burst-code-${i}"
+                ) &
+            done
+            wait
+
+            # One file per reader, each holding a bare code with no newline — so count the
+            # files, not the lines. Concatenating them produced "200200200…" and a count of
+            # zero, which read as a total failure of the very thing that had just worked.
+            codes=$(for f in /tmp/burst-code-*; do printf '%s ' "$(cat "$f")"; done)
+            two_hundreds=$(grep -lx 200 /tmp/burst-code-* 2>/dev/null | wc -l | tr -d ' ')
+            note "responses: ${codes}"
+            [ "${two_hundreds:-0}" -ge 10 ] \
+                && ok "${two_hundreds}/12 readers were served the stale answer immediately" \
+                || note "${two_hundreds}/12 got 200; the rest were told it is being prepared"
+
+            # The point of the case. One refresh, not twelve.
+            sleep 20
+            after=$(docker compose logs --tail=2000 expense 2>/dev/null | grep -c "Handling control command" || true)
+            issued=$((after - before))
+            note "commands delivered to the integration: ${issued}"
+            [ "${issued:-0}" -le 2 ] \
+                && ok "one refresh covered all twelve readers" \
+                || bad "${issued} commands for one expiring entry — the readers stampeded"
+
+            rows=$(psql_q "SELECT count(*) FROM cache_entry WHERE cache_key = '${key}'")
+            [ "${rows:-0}" = "1" ] \
+                && ok "still one row for the entry" \
+                || bad "${rows} rows for one cache key"
+
+            rm -f /tmp/burst-*.out /tmp/burst-code-*
+        fi
+    fi
+fi
+
 # ── A17. Exactly one outcome record per operation ────────────────────────────
 # Four workers heartbeat independently and a result can be redelivered, so "record the
 # outcome" must be idempotent. Two nodes seeing the same result must not both write it.
