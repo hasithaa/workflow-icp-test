@@ -15,6 +15,18 @@ set -euo pipefail
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$HERE"
 
+# One file drives the whole environment, this script included. It was the ONE script that did
+# not read .env, which is the worst place for the omission: the refs below decide which
+# branches get built, so a ref set in .env was ignored and the build quietly produced
+# artifacts from the defaults while reporting exactly what it had built. Sourced before the
+# defaults below, so `: "${VAR:=...}"` fills in only what .env left unset.
+if [ -f .env ]; then
+    set -a
+    # shellcheck disable=SC1091
+    . ./.env
+    set +a
+fi
+
 # Where the sources come from.
 #
 # Two modes, and the default suits whoever is running this. With no checkouts present the

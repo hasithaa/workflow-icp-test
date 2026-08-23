@@ -82,6 +82,10 @@ print(len(items))
     ops_count=$(count_tasks "$ops_token") || ops_count="err:$ops_count"
     token="$ADMIN_TOKEN"
 
+    # These three are read at three different instants, and each role set has its OWN cache
+    # entry refreshing on its own schedule — so admin and approver can legitimately report
+    # different totals while tasks are being created and decided around them. The invariant is
+    # the last one: ops sees NONE of them. A difference between the first two is not a leak.
     note "admin=${admin_count} approver=${approver_count} ops=${ops_count}"
     case "$admin_count" in
         ''|*[!0-9]*) bad "the admin's task list did not load (${admin_count})" ;;
@@ -655,7 +659,11 @@ if [ "$WANT" = "all" ] || [ "$WANT" = "A19" ]; then
                            token = NULL, claimed_at = NULL WHERE cache_key = '${key}'" >/dev/null
             note "expired it; releasing 12 concurrent readers"
 
-            before=$(docker compose logs --tail=2000 expense 2>/dev/null | grep -c "Handling control command" || true)
+            # Counted for THIS entry, by its cache key: a read's command id is
+            # wfr-<cacheKey>.<token>. Counting every command in the window instead made any
+            # other view's refresh look like a stampede on this one — which it did, twice,
+            # whenever A19 ran after another case rather than alone.
+            before=$(docker compose logs --tail=2000 expense 2>/dev/null | grep -c "$key" || true)
             for i in $(seq 1 12); do
                 (
                     WF_OUT="/tmp/burst-${i}.out"
@@ -678,10 +686,10 @@ if [ "$WANT" = "all" ] || [ "$WANT" = "A19" ]; then
 
             # The point of the case. One refresh, not twelve.
             sleep 20
-            after=$(docker compose logs --tail=2000 expense 2>/dev/null | grep -c "Handling control command" || true)
+            after=$(docker compose logs --tail=2000 expense 2>/dev/null | grep -c "$key" || true)
             issued=$((after - before))
-            note "commands delivered to the integration: ${issued}"
-            [ "${issued:-0}" -le 2 ] \
+            note "commands delivered for this entry: ${issued}"
+            [ "${issued:-0}" -le 1 ] \
                 && ok "one refresh covered all twelve readers" \
                 || bad "${issued} commands for one expiring entry — the readers stampeded"
 
