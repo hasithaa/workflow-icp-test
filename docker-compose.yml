@@ -160,7 +160,11 @@ services:
       ENABLE_ES: "false"
       SKIP_DEFAULT_NAMESPACE_CREATION: "false"
       DEFAULT_NAMESPACE: default
-      DEFAULT_NAMESPACE_RETENTION: 24h
+      # 24h retention silently deleted every CLOSED run a day after it finished — completed
+      # tasks and workflows vanished from all listings and looked like ICP data corruption
+      # (2026-08-28). Retention only applies at namespace creation; changing it later needs
+      # `temporal operator namespace update --retention`. A test environment wants its history.
+      DEFAULT_NAMESPACE_RETENTION: 720h
     depends_on:
       temporal-postgres:
         condition: service_healthy

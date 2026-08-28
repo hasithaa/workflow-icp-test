@@ -135,7 +135,13 @@ BRIDGE_REPO="$(resolve_repo icp-runtime-bridge "$BRIDGE_REPO" "$BRIDGE_GIT" "$BR
 # ── 1. ICP distribution ──────────────────────────────────────────────────────
 if [ "$SKIP_ICP" -eq 0 ]; then
     log "Assembling the ICP distribution"
-    (cd "$ICP_REPO" && ./gradlew assembleICP)
+    # CI=true because assembleICP runs `pnpm install`, and pnpm refuses to recreate a
+    # node_modules directory it did not create without a TTY —
+    # ERR_PNPM_ABORTED_REMOVE_MODULES_DIR_NO_TTY. This build is non-interactive by
+    # definition, which is exactly what that variable declares.
+    # Drop prior frontend output first: gradle has packed a dist/ older than the
+    # checked-out sources before, shipping a stale console into the zip.
+    (cd "$ICP_REPO" && rm -rf frontend/dist www/assets www/index.html && CI=true ./gradlew assembleICP)
     cp "$ICP_REPO/build/distribution/${ICP_DIST}.zip" "icp/artifacts/${ICP_DIST}.zip"
     echo "staged icp/artifacts/${ICP_DIST}.zip"
 fi
